@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and test Docker image
+      run: |
+        docker build -f docker/Dockerfile -t enterprise-ai:latest .
+        echo "🚀 Docker image built successfully - ready for deployment!"

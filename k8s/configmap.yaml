@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: enterprise-ai-config
+  labels:
+    app: enterprise-ai
+data:
+  ENV: "production"
+  LOG_LEVEL: "INFO"
+  HOST: "0.0.0.0"
+  PORT: "8000"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: enterprise-ai-secrets
+  labels:
+    app: enterprise-ai
+type: Opaque
+stringData:
+  # Add your secret values here
+  DATABASE_URL: "postgresql://user:password@postgres:5432/enterprise_ai"
+  API_KEY: "your-api-key-here"
