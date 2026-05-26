@@ -62,6 +62,133 @@ def _extract_json(text: str):
 
 
 # ──────────────────────────────────────────────────────────────
+# ConversationMemory: tracks sources across turns
+# ──────────────────────────────────────────────────────────────
+
+class ConversationMemory:
+    """Tracks data sources and context across conversation turns.
+
+    Persists as long as the OrchestratorAgent instance lives
+    (which is per Streamlit session via st.session_state.agent).
+
+    Stores:
+    - repo_urls: GitHub repository URLs discussed
+    - drive_folders: Google Drive folder URLs discussed
+    - slack_channels: Slack channel IDs discussed
+    - turn_summaries: brief summary of what each turn was about
+    """
+
+    def __init__(self):
+        self.repo_urls: List[str] = []
+        self.drive_folders: List[str] = []
+        self.slack_channels: List[str] = []
+        self.turn_summaries: List[str] = []
+
+    def extract_sources_from_message(self, message: str) -> None:
+        """Parse user message for URLs and IDs, store new ones."""
+        # GitHub URLs
+        for match in re.finditer(
+            r"https?://github\.com/[\w\-]+/[\w\-]+", message
+        ):
+            url = match.group(0).rstrip("/")
+            if url not in self.repo_urls:
+                self.repo_urls.append(url)
+                logger.info(f"Memory: added repo {url}")
+
+        # Google Drive folder URLs
+        for match in re.finditer(
+            r"https?://drive\.google\.com/drive/folders/[\w\-]+", message
+        ):
+            url = match.group(0)
+            if url not in self.drive_folders:
+                self.drive_folders.append(url)
+                logger.info(f"Memory: added drive folder {url}")
+
+        # Slack channel IDs (C followed by alphanumeric)
+        for match in re.finditer(r"\b(C[A-Z0-9]{8,})\b", message):
+            channel_id = match.group(1)
+            if channel_id not in self.slack_channels:
+                self.slack_channels.append(channel_id)
+                logger.info(f"Memory: added slack channel {channel_id}")
+
+    def record_sources_from_results(self, memory: List[Dict]) -> None:
+        """After Action phase, extract sources discovered via semantic_search."""
+        for m in memory:
+            for r in m.get("results", []):
+                meta = r.get("metadata", {})
+                raw_repo = meta.get("repo_url", "")
+                if raw_repo:
+                    # Validate: extract a clean github.com URL even if
+                    # the metadata contains extra text around it
+                    match = re.search(
+                        r"https?://github\.com/[\w\-]+/[\w\-]+", raw_repo
+                    )
+                    if match:
+                        clean_url = match.group(0).rstrip("/")
+                        if clean_url not in self.repo_urls:
+                            self.repo_urls.append(clean_url)
+                            logger.info(
+                                f"Memory: discovered repo {clean_url} from cache"
+                            )
+                channel_id = meta.get("channel_id", "")
+                if channel_id and channel_id not in self.slack_channels:
+                    self.slack_channels.append(channel_id)
+                    logger.info(
+                        f"Memory: discovered channel {channel_id} from cache"
+                    )
+
+    def add_turn_summary(self, summary: str) -> None:
+        """Record what a turn was about."""
+        self.turn_summaries.append(summary)
+
+    def get_context_for_planner(self) -> str:
+        """Format memory as context string for the Plan/Reflect prompts."""
+        lines = []
+
+        if self.repo_urls:
+            lines.append(
+                "Previously discussed GitHub repositories:\n"
+                + "\n".join(f"  - {url}" for url in self.repo_urls)
+            )
+        if self.drive_folders:
+            lines.append(
+                "Previously discussed Google Drive folders:\n"
+                + "\n".join(f"  - {url}" for url in self.drive_folders)
+            )
+        if self.slack_channels:
+            lines.append(
+                "Previously discussed Slack channels:\n"
+                + "\n".join(f"  - {ch}" for ch in self.slack_channels)
+            )
+        if self.turn_summaries:
+            recent = self.turn_summaries[-5:]  # Last 5 turns
+            lines.append(
+                "Recent conversation topics:\n"
+                + "\n".join(f"  - {s}" for s in recent)
+            )
+
+        return "\n\n".join(lines) if lines else "(No prior context)"
+
+    def has_context(self) -> bool:
+        """Return True if any sources have been recorded."""
+        return bool(
+            self.repo_urls
+            or self.drive_folders
+            or self.slack_channels
+            or self.turn_summaries
+        )
+
+    def to_dict(self) -> dict:
+        """Serialize for logging/debugging."""
+        return {
+            "repo_urls": self.repo_urls,
+            "drive_folders": self.drive_folders,
+            "slack_channels": self.slack_channels,
+            "turn_count": len(self.turn_summaries),
+        }
+
+
+# ──────────────────────────────────────────────────────────────
 # Vector-aware tools (closure-based, for backward compatibility)
 # ──────────────────────────────────────────────────────────────
 
@@ -156,7 +283,7 @@ def _create_vector_tools(vector_store: Optional[MongoVectorStore]):
 
 
 # ──────────────────────────────────────────────────────────────
-# Orchestrator with Plan-Action-Reflect loop
+# Orchestrator with Plan-Action-Reflect loop + ConversationMemory
 # ──────────────────────────────────────────────────────────────
 
 class OrchestratorAgent:
@@ -172,7 +299,7 @@ class OrchestratorAgent:
             )
         )
 
-        # Initialize VectorDB singleton for orchestration memory
+        # Initialize VectorDB singleton — orchestrator owns caching
         try:
             self.vector_store = get_vector_store()
             self.logger.info("Vector store initialized for orchestrator")
@@ -180,10 +307,8 @@ class OrchestratorAgent:
             self.logger.warning(f"Vector store not available: {e}")
             self.vector_store = None
 
-        # Initialize sub-agents (lazy, kept for backward compat)
-        self.drive_agent = None
-        self.tavily_agent = None
-        self.codebase_agent = None
+        # Conversation memory — persists across turns in the same session
+        self.conversation_memory = ConversationMemory()
 
         # System prompt for final answer generation
         self.system_prompt = """
@@ -246,20 +371,32 @@ class OrchestratorAgent:
         """Process user message with Plan-Action-Reflect loop.
 
         Flow:
-        1. PLAN   - Decompose query into sub-tasks with tool selection
-        2. ACTION - Execute each sub-task, collect structured results
-        3. REFLECT - Evaluate completeness, optionally run more queries
+        0. UPDATE MEMORY - Extract sources from message, update context
+        1. PLAN   - Decompose query into sub-tasks (with conversation context)
+        2. ACTION - Execute each sub-task (with centralized cache checks)
+        3. REFLECT - Evaluate completeness (with conversation context)
         4. FUSE   - Combine all results into unified context
         5. ANSWER - Generate final response with fused context
+        6. RECORD - Store discovered sources for future turns
         """
         self.logger.info(f"Orchestrator received: {message[:100]}")
 
-        # 1. PLAN: decompose query into sub-tasks
+        # 0. UPDATE MEMORY: extract sources from user message
+        self.conversation_memory.extract_sources_from_message(message)
+        if self.conversation_memory.has_context():
+            self.logger.info(
+                f"Conversation memory: {self.conversation_memory.to_dict()}"
+            )
+
+        # 1. PLAN: decompose query into sub-tasks (with memory context)
         plan = self._plan(message)
 
         if not plan:
             # Simple query (greeting, etc.) — direct LLM response, no tools
             self.logger.info("No tool plan needed, generating direct response")
+            self.conversation_memory.add_turn_summary(
+                f"General question: {message[:60]}"
+            )
             agent = Agent(
                 model=self.bedrock_model,
                 system_prompt=self.system_prompt,
@@ -272,12 +409,12 @@ class OrchestratorAgent:
             f"{[a['tool'] for a in plan]}"
         )
 
-        # 2. ACTION: execute plan, collect structured results
+        # 2. ACTION: execute plan with centralized cache checks
         memory = self._execute_plan(plan, user_query=message)
         total_results = sum(len(m["results"]) for m in memory)
         self.logger.info(f"Action phase collected {total_results} total results")
 
-        # 3. REFLECT: check if we need more information
+        # 3. REFLECT: check if we need more information (with memory context)
         additional_plan = self._reflect(message, memory)
         if additional_plan:
             self.logger.info(
@@ -291,10 +428,18 @@ class OrchestratorAgent:
         self.logger.info(f"Fused context: {len(fused_context)} chars from {len(memory)} queries")
 
         # 5. ANSWER: generate final response with full context
-        return self._generate_answer(message, fused_context)
+        result = self._generate_answer(message, fused_context)
+
+        # 6. RECORD: store discovered sources for future turns
+        self.conversation_memory.record_sources_from_results(memory)
+        self.conversation_memory.add_turn_summary(
+            f"Query: {message[:60]} → {len(memory)} sources"
+        )
+
+        return result
 
     # ──────────────────────────────────────────────────────────
-    # PLAN: Query decomposition + tool selection
+    # PLAN: Query decomposition + tool selection (stateful)
     # ──────────────────────────────────────────────────────────
 
     def _plan(self, query: str) -> Optional[List[Dict]]:
@@ -303,25 +448,35 @@ class OrchestratorAgent:
         Uses LLM to analyze the query and produce a structured plan
         indicating which tools to use and what sub-queries to run.
 
+        The planner receives conversation memory so it can route
+        follow-up questions to the correct tools without needing
+        the user to re-provide URLs.
+
         Returns:
             list of {"tool": str, "queries": list[str]} or None
         """
+        # Build conversation context
+        memory_context = self.conversation_memory.get_context_for_planner()
+
         plan_prompt = f"""You are a planning module for an onboarding assistant.
 Analyze the user query and decide which tools to use.
 
 ## Available Tools
 1. **semantic_search** - Search cached documents in VectorDB (onboarding docs, past analyses, cached web results). Use this when information might already be cached from prior interactions.
 2. **web_search** - Search the internet for current information via Tavily. Use for best practices, current trends, external knowledge.
-3. **drive** - Fetch and analyze a Google Drive folder. Use ONLY when the user provides a drive.google.com link.
-4. **codebase** - Analyze a GitHub repository. Use ONLY when the user provides a github.com link.
-5. **slack** - Fetch and analyze Slack channel messages. Use ONLY when the user provides a Slack channel ID (e.g., "C0123456789") or mentions Slack.
+3. **drive** - Fetch and analyze a Google Drive folder. Use when a drive.google.com URL is available.
+4. **codebase** - Analyze a GitHub repository. Use when a github.com URL is available.
+5. **slack** - Fetch and analyze Slack channel messages. Use when a Slack channel ID is available.
+
+## Conversation Context
+{memory_context}
 
 ## Rules
 - If the query contains an actual URL starting with "drive.google.com/drive/folders/" → MUST include "drive" tool with the full URL as query
-- If the query merely *mentions* "Google Drive" or "drive" without an actual drive.google.com URL → do NOT use "drive" tool. Use "semantic_search" instead to look up previously cached Drive content.
 - If the query contains an actual URL starting with "github.com/" → MUST include "codebase" tool with the full URL as query
-- If the query merely *mentions* "GitHub" or a repository without an actual github.com URL → do NOT use "codebase" tool. Use "semantic_search" instead.
 - If the query mentions a Slack channel ID (C followed by digits/letters) → MUST include "slack" tool
+- If the query references a previously discussed source (listed in Conversation Context above) without providing the URL explicitly → use the stored URL from conversation context. For example, if the user asks "tell me more about KDA" and a GitHub repo was previously discussed, include "codebase" with that repo's URL.
+- If the query merely *mentions* "Google Drive", "GitHub", or "Slack" without referencing any known source → use "semantic_search" instead
 - For factual or current-info questions → include "web_search"
 - For follow-up questions about previously discussed content → include "semantic_search"
 - You can and SHOULD use multiple tools when appropriate
@@ -369,21 +524,21 @@ Return ONLY the JSON, no other text.
             return None
 
     # ──────────────────────────────────────────────────────────
-    # ACTION: Execute plan and collect structured results
+    # ACTION: Execute plan with centralized cache checks
     # ──────────────────────────────────────────────────────────
 
     def _execute_plan(self, plan: List[Dict], user_query: str = None) -> List[Dict]:
-        """Execute each planned action and collect structured results.
+        """Execute each planned action with centralized cache management.
 
-        Each tool returns results in a uniform format:
-        {"query": str, "source": str, "results": list[{"title", "url", "content"}]}
-
-        This enables fusion across heterogeneous sources.
+        For each tool call:
+        1. Check VectorDB cache first (orchestrator decides)
+        2. If cache is sufficient, use it — skip the agent
+        3. If cache is insufficient, call the agent (pure worker)
+        4. Cache new results for future queries
 
         Args:
             plan: List of planned actions with tool names and queries.
-            user_query: The user's original question. Passed to codebase agent
-                       for hybrid cache + targeted file fetching.
+            user_query: The user's original question.
         """
         memory = []
 
@@ -399,38 +554,224 @@ Return ONLY the JSON, no other text.
                         results = raw_vectordb_search(query)
 
                     elif tool_name == "web_search":
-                        results = raw_web_search(query)
+                        # Centralized cache: check for similar cached searches
+                        cached = self._check_cache(
+                            query, folder_id="tavily_searches", threshold=0.7
+                        )
+                        if cached:
+                            self.logger.info(
+                                "Using cached web search (orchestrator decision)"
+                            )
+                            results = [
+                                {
+                                    "title": "Cached Web Search",
+                                    "url": "",
+                                    "content": cached,
+                                }
+                            ]
+                        else:
+                            results = raw_web_search(query)
+                            # Cache results for future queries
+                            if results:
+                                self._cache_results(
+                                    tool_name, query, results,
+                                    folder_id="tavily_searches",
+                                )
 
                     elif tool_name == "drive":
-                        # Drive agent returns a formatted plan string;
-                        # wrap as structured data for fusion
-                        drive_response = trigger_google_drive_agent(query)
-                        results = [
-                            {
-                                "title": "Google Drive Content",
-                                "url": query,
-                                "content": str(drive_response),
-                            }
-                        ]
+                        # Resolve the actual Drive URL
+                        drive_url = self._resolve_drive_url(query)
+                        if not drive_url:
+                            self.logger.warning(
+                                f"No Drive URL found for: {query[:60]}"
+                            )
+                            results = [
+                                {
+                                    "title": "Drive Content",
+                                    "url": "",
+                                    "content": (
+                                        "Could not determine Drive folder URL. "
+                                        "Please provide a Google Drive link."
+                                    ),
+                                }
+                            ]
+                        else:
+                            folder_id = self._extract_drive_folder_id(drive_url)
+                            cached = self._check_cache(
+                                user_query or query,
+                                folder_id=folder_id,
+                                threshold=0.5,
+                            ) if folder_id else None
+
+                            if cached:
+                                self.logger.info(
+                                    "Using cached drive content "
+                                    "(orchestrator decision)"
+                                )
+                                results = [
+                                    {
+                                        "title": "Cached Drive Content",
+                                        "url": drive_url,
+                                        "content": cached,
+                                    }
+                                ]
+                            else:
+                                drive_response = trigger_google_drive_agent(
+                                    drive_url
+                                )
+                                results = [
+                                    {
+                                        "title": "Google Drive Content",
+                                        "url": drive_url,
+                                        "content": str(drive_response),
+                                    }
+                                ]
+                                # Cache for future queries
+                                if results and folder_id:
+                                    self._cache_results(
+                                        tool_name, query, results,
+                                        folder_id=folder_id,
+                                    )
 
                     elif tool_name == "codebase":
-                        # Codebase agent returns analysis string;
-                        # wrap as structured data for fusion.
-                        # Pass user_query for hybrid cache + targeted fetch.
-                        code_response = trigger_codebase_agent(
-                            query, query=user_query
-                        )
-                        results = [
-                            {
-                                "title": "Codebase Analysis",
-                                "url": query,
-                                "content": str(code_response),
-                            }
-                        ]
+                        # Resolve the actual GitHub URL.
+                        # The planner may pass a descriptive query like
+                        # "KDA attention implementation" instead of the URL.
+                        repo_url = self._resolve_repo_url(query)
+                        if not repo_url:
+                            self.logger.warning(
+                                f"No GitHub URL found in query or memory "
+                                f"for codebase tool: {query[:60]}"
+                            )
+                            results = [
+                                {
+                                    "title": "Codebase Analysis",
+                                    "url": "",
+                                    "content": (
+                                        "Could not determine repository URL. "
+                                        "Please provide a GitHub URL."
+                                    ),
+                                }
+                            ]
+                        else:
+                            # Use the planner's descriptive query as the
+                            # specific question (e.g. "CLI tool implementation
+                            # and entry points") — it's cleaner than the full
+                            # user message which may contain URLs, colons, etc.
+                            # that break GitHub code search.
+                            if query and repo_url != query:
+                                # Planner gave a descriptive sub-query
+                                specific_query = query
+                            elif user_query and repo_url != user_query:
+                                # Fallback to user message (but not if it IS
+                                # the URL)
+                                specific_query = user_query
+                            else:
+                                specific_query = None
+
+                            repo_id = self._extract_repo_id(repo_url)
+                            cache_folder = (
+                                f"github-{repo_id}" if repo_id else None
+                            )
+
+                            cached_content = None
+                            cache_relevant = False
+
+                            if cache_folder:
+                                cached_content = self._check_cache(
+                                    user_query or query,
+                                    folder_id=cache_folder,
+                                    threshold=0.5,
+                                )
+                                if cached_content:
+                                    cache_relevant = True
+                                    self.logger.info(
+                                        "Using cached codebase analysis "
+                                        "(orchestrator decision)"
+                                    )
+
+                            if cache_relevant:
+                                results = [
+                                    {
+                                        "title": "Cached Codebase Analysis",
+                                        "url": repo_url,
+                                        "content": cached_content,
+                                    }
+                                ]
+                            else:
+                                # Call agent as pure worker
+                                self.logger.info(
+                                    f"Calling codebase agent: "
+                                    f"url={repo_url}, query={specific_query}"
+                                )
+                                code_response = trigger_codebase_agent(
+                                    repo_url, query=specific_query
+                                )
+                                results = [
+                                    {
+                                        "title": "Codebase Analysis",
+                                        "url": repo_url,
+                                        "content": str(code_response),
+                                    }
+                                ]
+                                # Cache for future queries
+                                if results and cache_folder:
+                                    self._cache_results(
+                                        tool_name, query, results,
+                                        folder_id=cache_folder,
+                                        metadata={
+                                            "repo_url": repo_url,
+                                            "repo_id": repo_id,
+                                        },
+                                    )
 
                     elif tool_name == "slack":
-                        # Slack agent returns structured messages
-                        results = raw_slack_search(query)
+                        # Resolve the actual Slack channel ID
+                        channel_id = self._resolve_slack_channel(query)
+                        if not channel_id:
+                            self.logger.warning(
+                                f"No Slack channel ID found for: {query[:60]}"
+                            )
+                            results = [
+                                {
+                                    "title": "Slack Content",
+                                    "url": "",
+                                    "content": (
+                                        "Could not determine Slack channel ID. "
+                                        "Please provide a channel ID."
+                                    ),
+                                }
+                            ]
+                        else:
+                            slack_folder = f"slack-{channel_id}"
+                            cached = self._check_cache(
+                                user_query or query,
+                                folder_id=slack_folder,
+                                threshold=0.5,
+                            )
+                            if cached:
+                                self.logger.info(
+                                    "Using cached slack content "
+                                    "(orchestrator decision)"
+                                )
+                                results = [
+                                    {
+                                        "title": f"Cached Slack #{channel_id}",
+                                        "url": "",
+                                        "content": cached,
+                                    }
+                                ]
+                            else:
+                                results = raw_slack_search(channel_id)
+                                # Cache for future queries
+                                if results:
+                                    self._cache_results(
+                                        tool_name, query, results,
+                                        folder_id=slack_folder,
+                                        metadata={
+                                            "channel_id": channel_id,
+                                        },
+                                    )
 
                     else:
                         self.logger.warning(f"Unknown tool: {tool_name}")
@@ -457,7 +798,158 @@ Return ONLY the JSON, no other text.
         return memory
 
     # ──────────────────────────────────────────────────────────
-    # REFLECT: Evaluate completeness, optionally plan more
+    # Centralized cache helpers
+    # ──────────────────────────────────────────────────────────
+
+    def _check_cache(
+        self, query: str, folder_id: str = None, threshold: float = 0.5
+    ) -> Optional[str]:
+        """Check VectorDB cache for relevant content.
+
+        Returns cached content string if similarity >= threshold, else None.
+        This centralizes all cache-vs-fetch decisions in the orchestrator.
+
+        Uses ``use_query_embedding=True`` so the search compares the
+        incoming short query against the stored short query embedding
+        (not the full document embedding).  This avoids the "embedding
+        dilution" problem where a 5-word query gets low similarity
+        against a 3000-char document embedding.
+        """
+        if self.vector_store is None or self.vector_store.collection is None:
+            return None
+
+        try:
+            results = self.vector_store.search_similar(
+                query=query,
+                folder_id=folder_id,
+                top_k=1,
+                threshold=threshold,
+                use_query_embedding=True,
+            )
+            if results:
+                similarity = results[0].get("similarity", 0)
+                self.logger.info(
+                    f"Cache HIT: {similarity:.0%} relevance "
+                    f"(threshold: {threshold:.0%}, folder: {folder_id})"
+                )
+                return results[0].get("content", "")
+            return None
+        except Exception as e:
+            self.logger.warning(f"Cache check failed: {e}")
+            return None
+
+    def _cache_results(
+        self,
+        tool_name: str,
+        query: str,
+        results: List[Dict],
+        folder_id: str = None,
+        metadata: Dict = None,
+    ) -> None:
+        """Cache tool results in VectorDB for future queries.
+
+        Called by the orchestrator after a fresh fetch from any agent.
+        Stores a separate ``query_embedding`` (from the short query string)
+        alongside the full document embedding so that future cache lookups
+        compare short-to-short and avoid embedding dilution.
+        """
+        if not self.vector_store:
+            return
+
+        try:
+            combined = "\n\n".join(
+                f"[{r.get('title', '')}] {r.get('content', '')}"
+                for r in results
+                if r.get("content", "").strip()
+            )
+            if not combined.strip():
+                return
+
+            meta = {
+                "type": f"{tool_name}_result",
+                "query": query,
+                **(metadata or {}),
+            }
+
+            doc_id = self.vector_store.store_document(
+                content=f"Query: {query}\n\nResult:\n{combined}",
+                source=f"{tool_name}: {query[:50]}",
+                folder_id=folder_id or f"{tool_name}_results",
+                metadata=meta,
+                query_text=query,  # separate short-query embedding for cache lookups
+            )
+            if doc_id:
+                self.logger.info(f"Cached {tool_name} result: {doc_id}")
+        except Exception as e:
+            self.logger.warning(f"Could not cache {tool_name} result: {e}")
+
+    @staticmethod
+    def _extract_repo_id(query: str) -> Optional[str]:
+        """Extract repo ID (owner-name) from a GitHub URL or query."""
+        match = re.search(r"github\.com/([\w\-]+/[\w\-]+)", query)
+        if match:
+            return match.group(1).lower().replace("/", "-")
+        return None
+
+    @staticmethod
+    def _extract_drive_folder_id(query: str) -> Optional[str]:
+        """Extract folder ID from a Google Drive URL."""
+        if "/folders/" in query:
+            return query.split("/folders/")[-1].split("?")[0].split("#")[0]
+        return None
+
+    def _resolve_repo_url(self, query: str) -> Optional[str]:
+        """Resolve a GitHub repository URL from the query or conversation memory.
+
+        The planner may produce descriptive queries (e.g. "KDA attention
+        implementation") instead of the actual URL.  This method:
+        1. Checks if the query itself contains a github.com URL.
+        2. Checks the original user message for a github.com URL.
+        3. Falls back to the most recently discussed repo in conversation memory.
+        """
+        # 1. Query itself contains a URL
+        match = re.search(r"https?://github\.com/[\w\-]+/[\w\-]+", query)
+        if match:
+            return match.group(0).rstrip("/")
+
+        # 2. Check conversation memory (most recent repo first)
+        if self.conversation_memory.repo_urls:
+            url = self.conversation_memory.repo_urls[-1]
+            self.logger.info(f"Resolved repo URL from conversation memory: {url}")
+            return url
+
+        return None
+
+    def _resolve_drive_url(self, query: str) -> Optional[str]:
+        """Resolve a Google Drive folder URL from the query or conversation memory."""
+        match = re.search(
+            r"https?://drive\.google\.com/drive/folders/[\w\-]+", query
+        )
+        if match:
+            return match.group(0)
+
+        if self.conversation_memory.drive_folders:
+            url = self.conversation_memory.drive_folders[-1]
+            self.logger.info(f"Resolved drive URL from conversation memory: {url}")
+            return url
+
+        return None
+
+    def _resolve_slack_channel(self, query: str) -> Optional[str]:
+        """Resolve a Slack channel ID from the query or conversation memory."""
+        match = re.search(r"\b(C[A-Z0-9]{8,})\b", query)
+        if match:
+            return match.group(1)
+
+        if self.conversation_memory.slack_channels:
+            ch = self.conversation_memory.slack_channels[-1]
+            self.logger.info(f"Resolved channel from conversation memory: {ch}")
+            return ch
+
+        return None
+
+    # ──────────────────────────────────────────────────────────
+    # REFLECT: Evaluate completeness (with conversation memory)
     # ──────────────────────────────────────────────────────────
 
     def _reflect(
@@ -467,10 +959,11 @@ Return ONLY the JSON, no other text.
 
         If more information is needed, returns an additional plan
         (same format as _plan output). Otherwise returns None.
+
+        Receives conversation memory context so it can suggest
+        re-fetching from previously discussed sources.
         """
-        # Build a summary of what we've collected so far,
-        # including metadata (repo_url, channel_id, etc.) so the
-        # Reflect module can trigger targeted fetches from original sources.
+        # Build summary of collected results
         memory_items = []
         for m in memory:
             item = {
@@ -481,7 +974,7 @@ Return ONLY the JSON, no other text.
                     bool(r.get("content", "").strip()) for r in m["results"]
                 ),
             }
-            # Extract actionable metadata from results
+            # Extract actionable metadata
             for r in m["results"]:
                 meta = r.get("metadata", {})
                 if meta.get("repo_url"):
@@ -492,6 +985,7 @@ Return ONLY the JSON, no other text.
             memory_items.append(item)
 
         memory_summary = json.dumps(memory_items, indent=2)
+        conv_context = self.conversation_memory.get_context_for_planner()
 
         reflect_prompt = f"""You are a reflection module for an onboarding assistant.
 Evaluate whether the collected information is sufficient to answer the user's query.
@@ -502,17 +996,15 @@ Evaluate whether the collected information is sufficient to answer the user's qu
 ## Information Collected So Far
 {memory_summary}
 
+## Conversation Context (previously discussed sources)
+{conv_context}
+
 ## Available Tools
 - semantic_search: Search cached VectorDB documents
 - web_search: Search the internet via Tavily
-- codebase: Analyze a GitHub repository for detailed code-level answers. Use the repo_url from the collected results if available.
-- drive: Fetch a Google Drive folder. Use the drive URL from the collected results if available.
-- slack: Fetch Slack channel messages. Use the channel_id from the collected results if available.
-
-## Escalation Rules
-- If a semantic_search result came from a cached codebase analysis (has "repo_url") AND the similarity is LOW (below 0.5), the cached content may not fully answer the question. In this case, you SHOULD include a "codebase" tool call with the repo_url as query to fetch more detailed information.
-- Similarly, if a cached Drive or Slack result has low relevance, you can re-trigger those tools using the stored URLs/channel IDs.
-- This is how the system handles follow-up questions: semantic_search provides the cached URL, and you decide whether to escalate to a deeper fetch.
+- codebase: Analyze a GitHub repository. Use a repo URL from conversation context if available.
+- drive: Fetch a Google Drive folder. Use a drive URL from conversation context if available.
+- slack: Fetch Slack channel messages. Use a channel ID from conversation context if available.
 
 ## Instructions
 - If the information is SUFFICIENT to provide a good answer, return: null
@@ -524,7 +1016,7 @@ Evaluate whether the collected information is sufficient to answer the user's qu
 - Only suggest additional queries that would meaningfully improve the answer
 - Do NOT repeat queries that were already executed
 - Prefer web_search for general knowledge gaps
-- Use codebase/drive/slack with stored URLs for source-specific depth
+- Use codebase/drive/slack with URLs from conversation context for source-specific depth
 
 Return ONLY the JSON or null, no other text."""
 

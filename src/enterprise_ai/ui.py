@@ -1,7 +1,4 @@
 import logging
-
-from dotenv import load_dotenv
-load_dotenv()
 import streamlit as st
 
 from enterprise_ai.agents.orchestrator_caching import OrchestratorAgent
@@ -47,6 +44,9 @@ with st.sidebar:
     if st.button("Clear Chat", type="primary"):
         st.session_state.messages = []
         st.session_state.agent.messages = []
+        # Reset conversation memory so follow-up context starts fresh
+        from enterprise_ai.agents.orchestrator_caching import ConversationMemory
+        st.session_state.agent.conversation_memory = ConversationMemory()
         st.rerun()
 
 

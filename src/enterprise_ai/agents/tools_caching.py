@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────
 # Lazy singletons — avoid re-creating expensive objects
-# (MongoDB connection + embedding model + MCP client) on every call
+# (MCP client, Slack SDK, etc.) on every call.
+# Note: Agents are pure workers now; they never touch VectorDB.
 # ──────────────────────────────────────────────────────────────
 
 _tavily_agent: Optional[TavilyAgent] = None
@@ -48,6 +49,7 @@ def _get_vector_store() -> MongoVectorStore:
 # ──────────────────────────────────────────────────────────────
 # Raw search helpers (for Plan-Action-Reflect result fusion)
 # These return structured data, NOT @tool-decorated.
+# Called by the orchestrator's _execute_plan().
 # ──────────────────────────────────────────────────────────────
 
 
@@ -110,21 +112,25 @@ def raw_vectordb_search(query: str, folder_id: Optional[str] = None) -> List[Dic
         return []
 
 
+# ──────────────────────────────────────────────────────────────
+# @tool-decorated functions — used by the legacy Agent tool list
+# and directly by _execute_plan for agent invocation.
+#
+# Agents are pure workers: they always fetch fresh.
+# Caching is handled by the orchestrator (_check_cache / _cache_results).
+# ──────────────────────────────────────────────────────────────
+
+
 @tool
 def trigger_tavily_agent(context: str) -> str:
     """
-    Triggers the Tavily Agent to perform a web search with VectorDB caching.
-
-    Features:
-    - Searches the web for current information
-    - Caches results in MongoDB for future queries
-    - Returns semantic similarity matches from cache when available
+    Triggers the Tavily Agent to perform a web search.
 
     Args:
         context (str): Natural language search query
 
     Returns:
-        str: Concise summary from web search or cached results
+        str: Concise summary from web search
 
     Example:
         >>> trigger_tavily_agent("Best practices for React in 2024")
@@ -144,20 +150,14 @@ def trigger_tavily_agent(context: str) -> str:
 @tool
 def trigger_google_drive_agent(drive_links: str) -> str:
     """
-    Triggers the Google Drive Agent with VectorDB caching.
-
-    Features:
-    - Processes Google Drive folders for onboarding documents
-    - Caches documents and embeddings in MongoDB
-    - Returns cached results for repeated queries (0.2s instead of 3-5s)
-    - Supports Word, Excel, Google Docs, Google Sheets, and text files
+    Triggers the Google Drive Agent to fetch and analyze a Drive folder.
 
     Args:
         drive_links (str): Google Drive folder URL
                           Format: https://drive.google.com/drive/folders/FOLDER_ID
 
     Returns:
-        str: Formatted onboarding plan with caching status
+        str: Formatted onboarding plan from Drive documents
 
     Example:
         >>> trigger_google_drive_agent(
@@ -180,7 +180,7 @@ def trigger_google_drive_agent(drive_links: str) -> str:
             except Exception as e:
                 logger.warning(f"Could not load token.pickle: {e}")
 
-        # Initialize DriveAgent with VectorDB
+        # Initialize DriveAgent (pure worker — no VectorDB)
         agent = DriveAgent(
             credentials=creds,
             service_account_path=service_account_path
@@ -195,7 +195,7 @@ def trigger_google_drive_agent(drive_links: str) -> str:
                 f"Expected format: https://drive.google.com/drive/folders/FOLDER_ID\nReceived: {drive_links}"
             )
 
-        # Create onboarding plan (with caching)
+        # Create onboarding plan (always fetches fresh)
         logger.info(f"Creating onboarding plan from: {drive_links}")
         plan = agent.create_onboarding_plan(drive_links)
 
@@ -210,29 +210,21 @@ def trigger_google_drive_agent(drive_links: str) -> str:
 @tool
 def trigger_codebase_agent(repo_url: str, query: str = None) -> str:
     """
-    Triggers the Codebase Agent with VectorDB caching and hybrid deep-dive.
+    Triggers the Codebase Agent to fetch and analyze a GitHub repository.
 
-    Features:
-    - Analyzes GitHub repositories for developer onboarding
-    - Caches analysis results in MongoDB
-    - Returns cached results for repeated queries
-    - Extracts technologies, setup steps, and learning paths
-    - Hybrid mode: when a specific query is provided and the cached analysis
-      doesn't cover it, fetches targeted files from GitHub for a deeper answer
+    When a specific query is provided, fetches targeted files from
+    GitHub for a focused answer instead of a generic overview.
 
     Args:
         repo_url (str): GitHub repository URL
                        Format: https://github.com/username/repository
         query (str, optional): Specific question about the repo.
-                              When provided, enables hybrid cache + targeted fetch.
 
     Returns:
         str: Structured onboarding plan or targeted analysis for the codebase
 
     Example:
-        >>> trigger_codebase_agent(
-        ...     'https://github.com/facebook/react'
-        ... )
+        >>> trigger_codebase_agent('https://github.com/facebook/react')
         >>> trigger_codebase_agent(
         ...     'https://github.com/facebook/react',
         ...     query='How does the fiber reconciliation algorithm work?'
@@ -264,13 +256,7 @@ def trigger_codebase_agent(repo_url: str, query: str = None) -> str:
 @tool
 def trigger_slack_agent(channel_id: str) -> str:
     """
-    Triggers the Slack Agent to fetch and analyze channel messages with VectorDB caching.
-
-    Features:
-    - Fetches recent messages from a Slack channel
-    - Caches messages in MongoDB for future queries
-    - Enriches messages with user display names
-    - Returns LLM-generated summary of channel activity
+    Triggers the Slack Agent to fetch and analyze channel messages.
 
     Args:
         channel_id (str): Slack channel ID (e.g., "C0123456789")
@@ -297,11 +283,6 @@ def trigger_slack_agent(channel_id: str) -> str:
 def semantic_search_vectordb(query: str, folder_id: Optional[str] = None) -> str:
     """
     Search all cached content semantically using MongoDB VectorDB.
-
-    Features:
-    - Searches by meaning, not keywords
-    - Can limit search to specific folder
-    - Returns results ranked by relevance
 
     Args:
         query (str): Search query
@@ -351,6 +332,11 @@ def semantic_search_vectordb(query: str, folder_id: Optional[str] = None) -> str
         return f"❌ Search error: {e}"
 
 
+# ──────────────────────────────────────────────────────────────
+# Private helpers
+# ──────────────────────────────────────────────────────────────
+
+
 def _is_valid_drive_link(link: str) -> bool:
     """Validate Google Drive folder link format"""
     valid_formats = [
@@ -361,7 +347,7 @@ def _is_valid_drive_link(link: str) -> bool:
 
 
 def _format_plan_response(plan, auth_method: str) -> str:
-    """Format onboarding plan response with caching info"""
+    """Format onboarding plan response"""
     result = "**📋 Google Drive Folder Analysis**\n\n"
 
     # Authentication status
@@ -371,12 +357,6 @@ def _format_plan_response(plan, auth_method: str) -> str:
         result += "✅ *Using User OAuth Credentials*\n\n"
     else:
         result += "ℹ️ *Using Demo Mode*\n\n"
-
-    # Cache status
-    if plan.cached:
-        result += "📦 *Using cached documents (from VectorDB)* ⚡\n\n"
-    else:
-        result += "🔄 *Fresh fetch from Google Drive*\n\n"
 
     # Accessibility
     if not plan.is_accessible:
@@ -423,7 +403,11 @@ def _format_error_response(title: str, message: str) -> str:
     return result
 
 
-# Helper function to get cache statistics
+# ──────────────────────────────────────────────────────────────
+# Utility functions (for debugging / admin)
+# ──────────────────────────────────────────────────────────────
+
+
 def get_vectordb_stats() -> dict:
     """Get MongoDB VectorDB statistics"""
     try:
@@ -434,7 +418,6 @@ def get_vectordb_stats() -> dict:
         return {}
 
 
-# Helper function to clear cache
 def clear_vectordb_cache(folder_id: str) -> int:
     """Clear VectorDB cache for specific folder"""
     try:

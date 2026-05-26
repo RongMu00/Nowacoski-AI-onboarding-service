@@ -173,7 +173,8 @@ class MongoVectorStore:
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
         source: Optional[str] = None,
-        folder_id: Optional[str] = None
+        folder_id: Optional[str] = None,
+        query_text: Optional[str] = None,
     ) -> str:
         """
         Store a document with its embedding
@@ -183,6 +184,11 @@ class MongoVectorStore:
             metadata: Optional metadata dictionary
             source: Source identifier (e.g., URL, file path)
             folder_id: Optional folder/group identifier for organizing documents
+            query_text: Optional original query string.  When provided, a
+                        separate ``query_embedding`` is stored alongside the
+                        content embedding so that cache lookups can compare
+                        short-query-to-short-query (avoiding embedding dilution
+                        from long document content).
 
         Returns:
             Document ID
@@ -193,7 +199,7 @@ class MongoVectorStore:
             return None
 
         try:
-            # Generate embedding
+            # Generate embedding for the full document content
             embedding = self.embeddings_model.encode(content).tolist()
 
             # Merge folder_id into metadata
@@ -209,6 +215,12 @@ class MongoVectorStore:
                 "source": source,
             }
 
+            # Store a separate query embedding for cache-hit lookups
+            if query_text:
+                doc["query_embedding"] = self.embeddings_model.encode(
+                    query_text
+                ).tolist()
+
             # Store in MongoDB
             result = self.collection.insert_one(doc)
 
@@ -223,7 +235,8 @@ class MongoVectorStore:
         query: str,
         top_k: int = 5,
         threshold: float = 0.3,
-        folder_id: Optional[str] = None
+        folder_id: Optional[str] = None,
+        use_query_embedding: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Search for similar documents using cosine similarity
@@ -233,6 +246,12 @@ class MongoVectorStore:
             top_k: Number of results to return
             threshold: Similarity threshold (0-1)
             folder_id: Optional folder to limit search scope
+            use_query_embedding: When True, compare the search query against
+                                 each document's ``query_embedding`` field
+                                 (short-to-short comparison) instead of the
+                                 full content ``embedding``.  Falls back to
+                                 the content embedding if a document has no
+                                 ``query_embedding``.
 
         Returns:
             List of similar documents with scores
@@ -251,20 +270,27 @@ class MongoVectorStore:
             if folder_id:
                 mongo_filter["metadata.folder_id"] = folder_id
 
+            # Determine which fields to fetch
+            projection = {
+                "content": 1, "metadata": 1, "source": 1, "embedding": 1,
+            }
+            if use_query_embedding:
+                projection["query_embedding"] = 1
+
             # Fetch documents with embeddings from MongoDB
-            cursor = self.collection.find(
-                mongo_filter,
-                {"content": 1, "metadata": 1, "source": 1, "embedding": 1}
-            )
+            cursor = self.collection.find(mongo_filter, projection)
 
             # Compute cosine similarity in Python
             scored_results = []
             for doc in cursor:
-                doc_embedding = doc.get("embedding")
-                if not doc_embedding:
-                    continue
-
-                doc_vec = np.array(doc_embedding)
+                # Pick the comparison vector
+                if use_query_embedding and doc.get("query_embedding"):
+                    doc_vec = np.array(doc["query_embedding"])
+                else:
+                    doc_vec = doc.get("embedding")
+                    if not doc_vec:
+                        continue
+                    doc_vec = np.array(doc_vec)
 
                 # Cosine similarity = dot(a, b) / (||a|| * ||b||)
                 dot_product = np.dot(query_embedding, doc_vec)
