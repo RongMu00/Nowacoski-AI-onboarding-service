@@ -468,21 +468,30 @@ Return ONLY the JSON, no other text.
         If more information is needed, returns an additional plan
         (same format as _plan output). Otherwise returns None.
         """
-        # Build a summary of what we've collected so far
-        memory_summary = json.dumps(
-            [
-                {
-                    "query": m["query"],
-                    "source": m["source"],
-                    "result_count": len(m["results"]),
-                    "has_content": any(
-                        bool(r.get("content", "").strip()) for r in m["results"]
-                    ),
-                }
-                for m in memory
-            ],
-            indent=2,
-        )
+        # Build a summary of what we've collected so far,
+        # including metadata (repo_url, channel_id, etc.) so the
+        # Reflect module can trigger targeted fetches from original sources.
+        memory_items = []
+        for m in memory:
+            item = {
+                "query": m["query"],
+                "source": m["source"],
+                "result_count": len(m["results"]),
+                "has_content": any(
+                    bool(r.get("content", "").strip()) for r in m["results"]
+                ),
+            }
+            # Extract actionable metadata from results
+            for r in m["results"]:
+                meta = r.get("metadata", {})
+                if meta.get("repo_url"):
+                    item["repo_url"] = meta["repo_url"]
+                    item["similarity"] = r.get("similarity", 0.0)
+                if meta.get("channel_id"):
+                    item["channel_id"] = meta["channel_id"]
+            memory_items.append(item)
+
+        memory_summary = json.dumps(memory_items, indent=2)
 
         reflect_prompt = f"""You are a reflection module for an onboarding assistant.
 Evaluate whether the collected information is sufficient to answer the user's query.
@@ -494,11 +503,16 @@ Evaluate whether the collected information is sufficient to answer the user's qu
 {memory_summary}
 
 ## Available Tools
-- semantic_search: Search cached VectorDB documents (use for follow-up questions about previously fetched content)
+- semantic_search: Search cached VectorDB documents
 - web_search: Search the internet via Tavily
-- drive: Fetch Google Drive folder (ONLY if the original query contains a drive.google.com URL — never for follow-up questions)
-- codebase: Analyze GitHub repo (ONLY if the original query contains a github.com URL — never for follow-up questions)
-- slack: Fetch Slack channel messages (only if user provided a Slack channel ID)
+- codebase: Analyze a GitHub repository for detailed code-level answers. Use the repo_url from the collected results if available.
+- drive: Fetch a Google Drive folder. Use the drive URL from the collected results if available.
+- slack: Fetch Slack channel messages. Use the channel_id from the collected results if available.
+
+## Escalation Rules
+- If a semantic_search result came from a cached codebase analysis (has "repo_url") AND the similarity is LOW (below 0.5), the cached content may not fully answer the question. In this case, you SHOULD include a "codebase" tool call with the repo_url as query to fetch more detailed information.
+- Similarly, if a cached Drive or Slack result has low relevance, you can re-trigger those tools using the stored URLs/channel IDs.
+- This is how the system handles follow-up questions: semantic_search provides the cached URL, and you decide whether to escalate to a deeper fetch.
 
 ## Instructions
 - If the information is SUFFICIENT to provide a good answer, return: null
@@ -509,7 +523,8 @@ Evaluate whether the collected information is sufficient to answer the user's qu
 ]
 - Only suggest additional queries that would meaningfully improve the answer
 - Do NOT repeat queries that were already executed
-- Prefer web_search for filling knowledge gaps
+- Prefer web_search for general knowledge gaps
+- Use codebase/drive/slack with stored URLs for source-specific depth
 
 Return ONLY the JSON or null, no other text."""
 

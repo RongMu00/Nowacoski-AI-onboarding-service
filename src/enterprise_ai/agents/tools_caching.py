@@ -85,7 +85,9 @@ def raw_vectordb_search(query: str, folder_id: Optional[str] = None) -> List[Dic
     """Execute VectorDB semantic search and return structured results for fusion.
 
     Returns:
-        list of {"title": str, "url": str, "content": str}
+        list of {"title": str, "url": str, "content": str, "metadata": dict, "similarity": float}
+        metadata is preserved so the orchestrator can extract repo_url
+        for hybrid targeted fetching on follow-up questions.
     """
     logger.info(f"Raw VectorDB search: {query[:60]}")
     try:
@@ -96,8 +98,10 @@ def raw_vectordb_search(query: str, folder_id: Optional[str] = None) -> List[Dic
         return [
             {
                 "title": r.get("source", "Cached Document"),
-                "url": "",
+                "url": r.get("metadata", {}).get("repo_url", ""),
                 "content": r.get("content", ""),
+                "metadata": r.get("metadata", {}),
+                "similarity": r.get("similarity", 0.0),
             }
             for r in results
         ]
