@@ -60,7 +60,7 @@ class TavilyAgent:
             self.messages = agent.messages
             self.tool_names = sorted(agent.tool_names)
 
-    def __call__(self, message: str) -> AgentResult:
+    def __call__(self, message: str):
         """
         Process search query with VectorDB caching
 
@@ -68,13 +68,16 @@ class TavilyAgent:
         1. Check cache for similar queries
         2. If no match, search via Tavily
         3. Cache results for future queries
+
+        Returns:
+            AgentResult from fresh search, or str from cache
         """
         self.logger.info(f"Tavily search: {message}")
 
         # STEP 1: Check cache for similar queries
         cached_result = self._get_cached_search(message)
         if cached_result:
-            self.logger.info("Using cached search result")
+            self.logger.info("📦 Using cached search result")
             return cached_result
 
         # STEP 2: Perform web search via Tavily

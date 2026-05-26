@@ -22,6 +22,97 @@ dotenv.load_dotenv()
 logger = logging.getLogger("orchestrator")
 
 
+def _create_vector_tools(vector_store: Optional[MongoVectorStore]):
+    """Create @tool-decorated functions that close over the vector_store instance.
+
+    This avoids using @tool on instance methods, which can expose 'self'
+    as a tool parameter to the LLM.
+    """
+
+    @tool
+    def semantic_search_all(query: str) -> str:
+        """
+        Search all cached documents semantically
+
+        Searches across:
+        - Google Drive documents (onboarding content)
+        - GitHub repositories (codebase analyses)
+        - Tavily search results (web searches)
+
+        Use this to find relevant cached content without re-fetching.
+        """
+        logger.info(f"Semantic search: {query}")
+
+        if not vector_store:
+            return "Vector store not available"
+
+        try:
+            results = vector_store.search_similar(query=query, top_k=5, threshold=0.3)
+
+            if not results:
+                return f"No relevant cached content found for: {query}"
+
+            output = f"**Found {len(results)} relevant cached documents:**\n\n"
+
+            for i, result in enumerate(results, 1):
+                similarity = result.get('similarity', 0)
+                source = result.get('source', 'Unknown')
+                metadata = result.get('metadata', {})
+                content_snippet = result.get('content', '')[:150]
+
+                # Determine type
+                doc_type = "Document"
+                if metadata.get('type') == 'codebase_analysis':
+                    doc_type = "Repository"
+                elif metadata.get('type') == 'web_search':
+                    doc_type = "Web Search"
+
+                output += f"{i}. {doc_type}: **{source}** ({similarity:.0%} relevant)\n"
+                output += f"   > {content_snippet}...\n\n"
+
+            return output
+
+        except Exception as e:
+            logger.error(f"Semantic search error: {e}")
+            return f"Search error: {e}"
+
+    @tool
+    def get_cache_status() -> str:
+        """
+        Get statistics about cached content across all sources
+
+        Shows:
+        - Total cached documents
+        - Cache breakdown by source
+        - Embedding model info
+        """
+        logger.info("Retrieving cache status")
+
+        if not vector_store:
+            return "Vector store not available"
+
+        try:
+            stats = vector_store.get_stats()
+
+            output = "**Vector Cache Status:**\n\n"
+            output += f"- Total Cached Documents: {stats.get('document_count', 0)}\n"
+            output += f"- Embedding Dimension: {stats.get('embedding_dimension', 0)}\n"
+            output += f"- Database: {stats.get('database', 'Unknown')}\n"
+            output += f"- Collection: {stats.get('collection', 'Unknown')}\n"
+            output += "\n**Cache Sources:**\n"
+            output += "- Google Drive (onboarding_content)\n"
+            output += "- GitHub (github-*)\n"
+            output += "- Web Searches (tavily_searches)\n"
+
+            return output
+
+        except Exception as e:
+            logger.warning(f"Could not get cache status: {e}")
+            return "Unable to retrieve cache statistics"
+
+    return semantic_search_all, get_cache_status
+
+
 class OrchestratorAgent:
     def __init__(self):
         """Initialize Orchestrator with multi-agent coordination and VectorDB"""
@@ -96,13 +187,16 @@ class OrchestratorAgent:
             - Improving response speed
         """
 
-        # Define tools with VectorDB-aware versions
+        # Create vector-aware tools via factory (avoids @tool on instance methods)
+        self._semantic_search_all, self._get_cache_status = _create_vector_tools(self.vector_store)
+
+        # Define tools
         tools = [
             trigger_tavily_agent,
             trigger_google_drive_agent,
             trigger_codebase_agent,
-            self.semantic_search_all,
-            self.get_cache_status
+            self._semantic_search_all,
+            self._get_cache_status
         ]
 
         agent = Agent(
@@ -113,87 +207,6 @@ class OrchestratorAgent:
         self.messages = agent.messages
         self.tool_names = sorted(agent.tool_names)
 
-    @tool
-    def semantic_search_all(self, query: str) -> str:
-        """
-        Search all cached documents semantically
-
-        Searches across:
-        - Google Drive documents (onboarding content)
-        - GitHub repositories (codebase analyses)
-        - Tavily search results (web searches)
-
-        Use this to find relevant cached content without re-fetching.
-        """
-        self.logger.info(f"Semantic search: {query}")
-
-        if not self.vector_store:
-            return "Vector store not available"
-
-        try:
-            results = self.vector_store.search_similar(query=query, top_k=5, threshold=0.3)
-
-            if not results:
-                return f"No relevant cached content found for: {query}"
-
-            output = f"**Found {len(results)} relevant cached documents:**\n\n"
-
-            for i, result in enumerate(results, 1):
-                similarity = result.get('similarity', 0)
-                source = result.get('source', 'Unknown')
-                metadata = result.get('metadata', {})
-                content_snippet = result.get('content', '')[:150]
-
-                # Determine type
-                doc_type = "Document"
-                if metadata.get('type') == 'codebase_analysis':
-                    doc_type = "Repository"
-                elif metadata.get('type') == 'web_search':
-                    doc_type = "Web Search"
-
-                output += f"{i}. {doc_type}: **{source}** ({similarity:.0%} relevant)\n"
-                output += f"   > {content_snippet}...\n\n"
-
-            return output
-
-        except Exception as e:
-            self.logger.error(f"Semantic search error: {e}")
-            return f"Search error: {e}"
-
-    @tool
-    def get_cache_status(self) -> str:
-        """
-        Get statistics about cached content across all sources
-
-        Shows:
-        - Total cached documents
-        - Cache breakdown by source
-        - Embedding model info
-        """
-        self.logger.info("Retrieving cache status")
-
-        if not self.vector_store:
-            return "Vector store not available"
-
-        try:
-            stats = self.vector_store.get_stats()
-
-            output = "**Vector Cache Status:**\n\n"
-            output += f"- Total Cached Documents: {stats.get('total_documents', 0)}\n"
-            output += f"- Average Size: {stats.get('avg_tokens', 0):.0f} tokens\n"
-            output += f"- Embedding Model: {stats.get('embedding_model', 'Unknown')}\n"
-            output += f"- Embedding Dimension: {stats.get('embedding_dimension', 0)}\n"
-            output += "\n**Cache Sources:**\n"
-            output += "- Google Drive (onboarding_content)\n"
-            output += "- GitHub (github-*)\n"
-            output += "- Web Searches (tavily_searches)\n"
-
-            return output
-
-        except Exception as e:
-            self.logger.warning(f"Could not get cache status: {e}")
-            return "Unable to retrieve cache statistics"
-
     def __call__(self, message: str) -> AgentResult:
         """Process user message with intelligent agent routing"""
         self.logger.info(f"Orchestrator received: {message[:100]}")
@@ -203,12 +216,13 @@ class OrchestratorAgent:
                 trigger_tavily_agent,
                 trigger_google_drive_agent,
                 trigger_codebase_agent,
-                self.semantic_search_all,
-                self.get_cache_status
+                self._semantic_search_all,
+                self._get_cache_status
             ],
             messages=self.messages,
             model=self.bedrock_model,
-            callback_handler=self._callback_handler()
+            system_prompt=self.system_prompt,
+            callback_handler=self._callback_handler
         )
 
         response = agent(message)

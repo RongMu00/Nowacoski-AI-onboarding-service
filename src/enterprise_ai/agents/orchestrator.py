@@ -92,7 +92,8 @@ class OrchestratorAgent():
             tools=[trigger_tavily_agent, trigger_google_drive_agent, trigger_codebase_agent],
             messages=self.messages,
             model=self.bedrock_model,
-            callback_handler=self._callback_handler()
+            system_prompt=self.system_prompt,
+            callback_handler=self._callback_handler
         )
         response = agent(message)
         self.messages = agent.messages
