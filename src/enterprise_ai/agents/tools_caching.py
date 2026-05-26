@@ -8,6 +8,7 @@ from strands import tool
 
 from enterprise_ai.agents.codebase_agent_caching import CodebaseAgent
 from enterprise_ai.agents.drive_agent_caching import DriveAgent
+from enterprise_ai.agents.slack_agent_caching import SlackAgent
 from enterprise_ai.agents.tavily_agent_caching import TavilyAgent
 from enterprise_ai.storage.vector_store import MongoVectorStore
 
@@ -34,6 +35,21 @@ def raw_web_search(query: str) -> List[Dict]:
         return agent.search_raw(query)
     except Exception as e:
         logger.error(f"Raw web search error: {e}")
+        return []
+
+
+def raw_slack_search(channel_id: str, limit: int = 50) -> List[Dict]:
+    """Fetch Slack channel messages and return structured results for fusion.
+
+    Returns:
+        list of {"title": str, "url": str, "content": str}
+    """
+    logger.info(f"Raw Slack search: channel {channel_id}")
+    try:
+        agent = SlackAgent()
+        return agent.search_raw(channel_id, limit)
+    except Exception as e:
+        logger.error(f"Raw Slack search error: {e}")
         return []
 
 
@@ -201,6 +217,38 @@ def trigger_codebase_agent(repo_url: str) -> str:
     except Exception as e:
         logger.error(f"Codebase agent error: {e}")
         return f"❌ Repository analysis error: {str(e)}"
+
+
+@tool
+def trigger_slack_agent(channel_id: str) -> str:
+    """
+    Triggers the Slack Agent to fetch and analyze channel messages with VectorDB caching.
+
+    Features:
+    - Fetches recent messages from a Slack channel
+    - Caches messages in MongoDB for future queries
+    - Enriches messages with user display names
+    - Returns LLM-generated summary of channel activity
+
+    Args:
+        channel_id (str): Slack channel ID (e.g., "C0123456789")
+
+    Returns:
+        str: Summary of channel messages relevant to onboarding
+
+    Example:
+        >>> trigger_slack_agent("C0123456789")
+    """
+    logger.info(f"💬 Slack agent triggered: {channel_id}")
+
+    try:
+        agent = SlackAgent()
+        response = agent(channel_id)
+        logger.info("✅ Slack analysis completed")
+        return str(response)
+    except Exception as e:
+        logger.error(f"Slack agent error: {e}")
+        return f"❌ Slack analysis error: {str(e)}"
 
 
 @tool

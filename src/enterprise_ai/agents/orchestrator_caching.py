@@ -10,10 +10,12 @@ from strands.agent.agent_result import AgentResult
 from strands.models import BedrockModel
 
 from enterprise_ai.agents.tools_caching import (
+    raw_slack_search,
     raw_vectordb_search,
     raw_web_search,
     trigger_codebase_agent,
     trigger_google_drive_agent,
+    trigger_slack_agent,
     trigger_tavily_agent,
 )
 from enterprise_ai.storage.vector_store import MongoVectorStore
@@ -191,9 +193,10 @@ class OrchestratorAgent:
             Your capabilities:
             1. **Google Drive Integration** - Fetch and analyze onboarding documents
             2. **GitHub Analysis** - Analyze codebases and repositories
-            3. **Web Search** - Get current information via Tavily
-            4. **Semantic Search** - Search all cached content by meaning
-            5. **Intelligent Routing** - Use the right agent for each query
+            3. **Slack Integration** - Fetch and analyze team channel messages
+            4. **Web Search** - Get current information via Tavily
+            5. **Semantic Search** - Search all cached content by meaning
+            6. **Intelligent Routing** - Use the right agent for each query
 
             Your goal is to help managers onboard new employees by:
             - Gathering context from Google Workspace, online resources, and code repos
@@ -222,6 +225,7 @@ class OrchestratorAgent:
             trigger_tavily_agent,
             trigger_google_drive_agent,
             trigger_codebase_agent,
+            trigger_slack_agent,
             self._semantic_search_all,
             self._get_cache_status,
         ]
@@ -310,10 +314,12 @@ Analyze the user query and decide which tools to use.
 2. **web_search** - Search the internet for current information via Tavily. Use for best practices, current trends, external knowledge.
 3. **drive** - Fetch and analyze a Google Drive folder. Use ONLY when the user provides a drive.google.com link.
 4. **codebase** - Analyze a GitHub repository. Use ONLY when the user provides a github.com link.
+5. **slack** - Fetch and analyze Slack channel messages. Use ONLY when the user provides a Slack channel ID (e.g., "C0123456789") or mentions Slack.
 
 ## Rules
 - If the query contains "drive.google.com" → MUST include "drive" tool with the full URL as query
 - If the query contains "github.com" → MUST include "codebase" tool with the full URL as query
+- If the query mentions a Slack channel ID (C followed by digits/letters) → MUST include "slack" tool
 - For factual or current-info questions → include "web_search"
 - For follow-up questions about previously discussed content → include "semantic_search"
 - You can and SHOULD use multiple tools when appropriate
@@ -412,6 +418,10 @@ Return ONLY the JSON, no other text.
                             }
                         ]
 
+                    elif tool_name == "slack":
+                        # Slack agent returns structured messages
+                        results = raw_slack_search(query)
+
                     else:
                         self.logger.warning(f"Unknown tool: {tool_name}")
                         results = []
@@ -478,6 +488,7 @@ Evaluate whether the collected information is sufficient to answer the user's qu
 - web_search: Search the internet via Tavily
 - drive: Fetch Google Drive folder (only if user provided a link)
 - codebase: Analyze GitHub repo (only if user provided a link)
+- slack: Fetch Slack channel messages (only if user provided a channel ID)
 
 ## Instructions
 - If the information is SUFFICIENT to provide a good answer, return: null
