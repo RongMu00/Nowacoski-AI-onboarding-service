@@ -126,7 +126,7 @@ class CodebaseAgent:
 
     def _get_cached_repo_content(self, repo_id: str) -> Optional[str]:
         """Retrieve cached repository analysis from VectorDB"""
-        if not self.vector_store or not self.vector_store.collection:
+        if not self.vector_store or self.vector_store.collection is None:
             return None
 
         try:

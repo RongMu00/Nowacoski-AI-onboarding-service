@@ -177,7 +177,7 @@ class TavilyAgent:
 
     def _get_cached_search(self, query: str) -> Optional[str]:
         """Retrieve cached search results using semantic similarity"""
-        if not self.vector_store or not self.vector_store.collection:
+        if not self.vector_store or self.vector_store.collection is None:
             return None
 
         try:

@@ -138,7 +138,7 @@ class DriveAgent:
 
     def _get_cached_content(self, folder_id: str) -> List[str]:
         """Retrieve cached documents from VectorDB"""
-        if not self.vector_store or not self.vector_store.collection:
+        if not self.vector_store or self.vector_store.collection is None:
             return []
 
         try:

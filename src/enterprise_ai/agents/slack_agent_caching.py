@@ -238,7 +238,7 @@ class SlackAgent:
 
     def _get_cached_channel(self, channel_id: str) -> Optional[str]:
         """Retrieve cached channel content from VectorDB."""
-        if not self.vector_store or not self.vector_store.collection:
+        if not self.vector_store or self.vector_store.collection is None:
             return None
 
         try:
