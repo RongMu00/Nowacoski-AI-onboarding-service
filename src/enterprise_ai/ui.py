@@ -1,6 +1,14 @@
+import logging
 import streamlit as st
 
 from enterprise_ai.agents.orchestrator_caching import OrchestratorAgent
+
+# Show INFO-level logs in terminal for Plan-Action-Reflect debugging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 # Page setup
 st.set_page_config(
