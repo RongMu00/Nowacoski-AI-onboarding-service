@@ -119,7 +119,7 @@ class MongoVectorStore:
     def _init_embeddings(self, embedding_model: str):
         """Initialize embedding model"""
 
-        if not self.collection:
+        if self.collection is None:
             self.logger.error("❌ Cannot initialize embeddings - MongoDB not connected")
             self.embeddings_model = None
             self.embedding_dim = None
@@ -148,7 +148,7 @@ class MongoVectorStore:
     def _ensure_indexes(self):
         """Create necessary indexes for efficient querying"""
 
-        if not self.collection:
+        if self.collection is None:
             return
 
         try:
@@ -188,7 +188,7 @@ class MongoVectorStore:
             Document ID
         """
 
-        if not self.collection or not self.embeddings_model:
+        if self.collection is None or self.embeddings_model is None:
             self.logger.warning("⚠️  Vector store not available - document not stored")
             return None
 
@@ -238,7 +238,7 @@ class MongoVectorStore:
             List of similar documents with scores
         """
 
-        if not self.collection or not self.embeddings_model:
+        if self.collection is None or self.embeddings_model is None:
             self.logger.warning("⚠️  Vector store not available - returning empty results")
             return []
 
@@ -305,7 +305,7 @@ class MongoVectorStore:
             List of matching documents
         """
 
-        if not self.collection:
+        if self.collection is None:
             return []
 
         try:
@@ -338,7 +338,7 @@ class MongoVectorStore:
     ) -> List[Dict[str, Any]]:
         """Get documents from a specific folder"""
 
-        if not self.collection:
+        if self.collection is None:
             return []
 
         try:
@@ -373,7 +373,7 @@ class MongoVectorStore:
             Number of documents deleted
         """
 
-        if not self.collection:
+        if self.collection is None:
             return 0
 
         try:
@@ -388,7 +388,7 @@ class MongoVectorStore:
     def get_stats(self) -> Dict[str, Any]:
         """Get vector store statistics"""
 
-        if not self.collection:
+        if self.collection is None:
             return {
                 "status": "disconnected",
                 "embedding_dimension": None,
@@ -418,7 +418,7 @@ class MongoVectorStore:
     def health_check(self) -> bool:
         """Check if vector store is healthy"""
 
-        if not self.client:
+        if self.client is None:
             return False
 
         try:
@@ -430,7 +430,7 @@ class MongoVectorStore:
     def clear_all(self) -> bool:
         """Clear all documents (use with caution!)"""
 
-        if not self.collection:
+        if self.collection is None:
             return False
 
         try:

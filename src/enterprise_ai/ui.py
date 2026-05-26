@@ -1,4 +1,7 @@
 import logging
+
+from dotenv import load_dotenv
+load_dotenv()
 import streamlit as st
 
 from enterprise_ai.agents.orchestrator_caching import OrchestratorAgent
