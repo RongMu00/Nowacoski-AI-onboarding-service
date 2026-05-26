@@ -22,6 +22,8 @@ class TavilyAgent:
         from dotenv import load_dotenv
         load_dotenv()
 
+        self.tavily_key = os.getenv('TAVILY_KEY', '')
+
         # Initialize MCP for Tavily
         url = 'https://mcp.tavily.com/mcp/?tavilyApiKey=' + os.getenv('TAVILY_KEY', '')
         self.mcp_client = MCPClient(lambda: streamablehttp_client(url=url))
@@ -100,6 +102,78 @@ class TavilyAgent:
                 self._cache_search_result(message, response)
 
             return response
+
+    def search_raw(self, query: str) -> List[Dict]:
+        """Return raw web search results as structured data for fusion.
+
+        Unlike __call__() which runs results through an LLM for summarization,
+        this method returns structured snippets directly from Tavily API,
+        suitable for result fusion in the Plan-Action-Reflect loop.
+
+        Returns:
+            list of {"title": str, "url": str, "content": str}
+        """
+        self.logger.info(f"Tavily raw search: {query}")
+
+        # Check cache first
+        cached = self._get_cached_search(query)
+        if cached:
+            self.logger.info("Using cached search result for raw search")
+            return [{"title": "Cached Result", "url": "", "content": cached}]
+
+        # Use tavily-python for direct API call (bypasses MCP + LLM summarization)
+        try:
+            from tavily import TavilyClient
+
+            client = TavilyClient(api_key=self.tavily_key)
+            response = client.search(query=query, max_results=5)
+
+            snippets = []
+            for result in response.get("results", []):
+                snippets.append({
+                    "title": result.get("title", ""),
+                    "url": result.get("url", ""),
+                    "content": result.get("content", ""),
+                })
+
+            # Cache the combined result for future queries
+            if self.vector_store and snippets:
+                combined_text = "\n\n".join(
+                    [f"[{s['title']}] {s['content']}" for s in snippets]
+                )
+                self._cache_raw_search_result(query, combined_text)
+
+            self.logger.info(f"Tavily raw search returned {len(snippets)} results")
+            return snippets
+
+        except Exception as e:
+            self.logger.error(f"Tavily raw search error: {e}")
+            return []
+
+    def _cache_raw_search_result(self, query: str, combined_text: str) -> bool:
+        """Cache raw search result text for future queries."""
+        if not self.vector_store:
+            return False
+
+        try:
+            doc_id = self.vector_store.store_document(
+                content=f"Query: {query}\n\nResult:\n{combined_text}",
+                source=f"Web Search: {query[:50]}",
+                folder_id="tavily_searches",
+                metadata={
+                    "type": "web_search",
+                    "query": query,
+                    "query_length": len(query),
+                    "result_length": len(combined_text),
+                },
+            )
+            if doc_id:
+                self.logger.info(f"Cached raw search result: {doc_id}")
+                return True
+            return False
+        except Exception as e:
+            self.logger.warning(f"Could not cache raw search result: {e}")
+            return False
 
     def _get_cached_search(self, query: str) -> Optional[str]:
         """Retrieve cached search results using semantic similarity"""

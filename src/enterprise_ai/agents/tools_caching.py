@@ -1,7 +1,7 @@
 import logging
 import os
 import pickle
-from typing import Optional
+from typing import Dict, List, Optional
 
 import dotenv
 from strands import tool
@@ -14,6 +14,52 @@ from enterprise_ai.storage.vector_store import MongoVectorStore
 dotenv.load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────
+# Raw search helpers (for Plan-Action-Reflect result fusion)
+# These return structured data, NOT @tool-decorated.
+# ──────────────────────────────────────────────────────────────
+
+
+def raw_web_search(query: str) -> List[Dict]:
+    """Execute web search via Tavily and return structured results for fusion.
+
+    Returns:
+        list of {"title": str, "url": str, "content": str}
+    """
+    logger.info(f"Raw web search: {query[:60]}")
+    try:
+        agent = TavilyAgent()
+        return agent.search_raw(query)
+    except Exception as e:
+        logger.error(f"Raw web search error: {e}")
+        return []
+
+
+def raw_vectordb_search(query: str, folder_id: Optional[str] = None) -> List[Dict]:
+    """Execute VectorDB semantic search and return structured results for fusion.
+
+    Returns:
+        list of {"title": str, "url": str, "content": str}
+    """
+    logger.info(f"Raw VectorDB search: {query[:60]}")
+    try:
+        vector_store = MongoVectorStore()
+        results = vector_store.search_similar(
+            query=query, folder_id=folder_id, top_k=5, threshold=0.3
+        )
+        return [
+            {
+                "title": r.get("source", "Cached Document"),
+                "url": "",
+                "content": r.get("content", ""),
+            }
+            for r in results
+        ]
+    except Exception as e:
+        logger.error(f"Raw VectorDB search error: {e}")
+        return []
 
 
 @tool

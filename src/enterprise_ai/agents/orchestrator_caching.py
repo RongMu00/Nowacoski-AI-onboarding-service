@@ -1,5 +1,7 @@
+import json
 import logging
 import os
+import re
 from typing import Dict, List, Optional
 
 import dotenv
@@ -7,10 +9,9 @@ from strands import Agent, tool
 from strands.agent.agent_result import AgentResult
 from strands.models import BedrockModel
 
-from enterprise_ai.agents.codebase_agent import CodebaseAgent
-from enterprise_ai.agents.drive_agent import DriveAgent
-from enterprise_ai.agents.tavily_agent import TavilyAgent
-from enterprise_ai.agents.tools import (
+from enterprise_ai.agents.tools_caching import (
+    raw_vectordb_search,
+    raw_web_search,
     trigger_codebase_agent,
     trigger_google_drive_agent,
     trigger_tavily_agent,
@@ -21,6 +22,46 @@ dotenv.load_dotenv()
 
 logger = logging.getLogger("orchestrator")
 
+
+# ──────────────────────────────────────────────────────────────
+# Helper: extract JSON from LLM response (strips markdown fences)
+# ──────────────────────────────────────────────────────────────
+
+def _extract_json(text: str):
+    """Extract JSON array or null from LLM response text.
+
+    Handles markdown code fences, leading/trailing whitespace,
+    and the literal string 'null' / 'None'.
+    """
+    cleaned = text.strip()
+
+    # Strip markdown code fences
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    cleaned = cleaned.strip()
+
+    if cleaned.lower() in ("null", "none", ""):
+        return None
+
+    # Find the first '[' to last ']' span
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: try parsing the whole string
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+
+
+# ──────────────────────────────────────────────────────────────
+# Vector-aware tools (closure-based, for backward compatibility)
+# ──────────────────────────────────────────────────────────────
 
 def _create_vector_tools(vector_store: Optional[MongoVectorStore]):
     """Create @tool-decorated functions that close over the vector_store instance.
@@ -60,7 +101,6 @@ def _create_vector_tools(vector_store: Optional[MongoVectorStore]):
                 metadata = result.get('metadata', {})
                 content_snippet = result.get('content', '')[:150]
 
-                # Determine type
                 doc_type = "Document"
                 if metadata.get('type') == 'codebase_analysis':
                     doc_type = "Repository"
@@ -113,15 +153,24 @@ def _create_vector_tools(vector_store: Optional[MongoVectorStore]):
     return semantic_search_all, get_cache_status
 
 
+# ──────────────────────────────────────────────────────────────
+# Orchestrator with Plan-Action-Reflect loop
+# ──────────────────────────────────────────────────────────────
+
 class OrchestratorAgent:
     def __init__(self):
         """Initialize Orchestrator with multi-agent coordination and VectorDB"""
         self.logger = logging.getLogger("orchestrator")
 
         # Initialize Bedrock model
-        self.bedrock_model = BedrockModel(model_id=os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0"))
+        self.bedrock_model = BedrockModel(
+            model_id=os.getenv(
+                "BEDROCK_MODEL_ID",
+                "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            )
+        )
 
-        # NEW: Initialize VectorDB for orchestration memory
+        # Initialize VectorDB for orchestration memory
         try:
             self.vector_store = MongoVectorStore()
             self.logger.info("Vector store initialized for orchestrator")
@@ -129,106 +178,429 @@ class OrchestratorAgent:
             self.logger.warning(f"Vector store not available: {e}")
             self.vector_store = None
 
-        # Initialize sub-agents
+        # Initialize sub-agents (lazy, kept for backward compat)
         self.drive_agent = None
         self.tavily_agent = None
         self.codebase_agent = None
 
-        # Setup system prompt
+        # System prompt for final answer generation
         self.system_prompt = """
-            CRITICAL MANDATORY RULES - FOLLOW EXACTLY
-
-            RULE 1 (ABSOLUTE PRIORITY):
-            If the user message contains "drive.google.com" or mentions "Google Drive":
-            → YOU MUST call trigger_google_drive_agent(drive_link) FIRST
-            → This is NOT optional
-            → Extract the full Google Drive URL and pass it to the tool
-
-            RULE 2:
-            If the user message contains "github.com":
-            → YOU MUST call trigger_codebase_agent(repo_url)
-
-            RULE 3:
-            If the user asks for current information or best practices:
-            → call trigger_tavily_agent(query)
-
-            RULE 4 (IMPORTANT):
-            You can and SHOULD use MULTIPLE tools in a single response.
-            Example: If user provides Drive link + asks question → use BOTH drive AND tavily agents
-
-            ═══════════════════════════════════════════════════════════
-
-            You are the Orchestrator AI for Nowacoski, an intelligent onboarding agent designed to create personalized, efficient onboarding experiences for full-time employees.
+            You are Nowacoski, an intelligent onboarding assistant that creates
+            personalized, efficient onboarding experiences for new employees.
 
             Your capabilities:
-            1. **Google Drive Integration** - Fetch and cache onboarding documents (with VectorDB)
-            2. **GitHub Analysis** - Analyze codebases and repositories (with VectorDB caching)
-            3. **Web Search** - Get current information via Tavily (with search result caching)
+            1. **Google Drive Integration** - Fetch and analyze onboarding documents
+            2. **GitHub Analysis** - Analyze codebases and repositories
+            3. **Web Search** - Get current information via Tavily
             4. **Semantic Search** - Search all cached content by meaning
             5. **Intelligent Routing** - Use the right agent for each query
 
-            Your goal is to help the manager successfully onboard a new employee by:
-            - Gathering context from Google Workspace, online resources, and code repositories
+            Your goal is to help managers onboard new employees by:
+            - Gathering context from Google Workspace, online resources, and code repos
             - Using cached data when available (faster and cheaper!)
             - Critically evaluating and prioritizing context
             - Generating a custom onboarding plan
 
-            Output an actionable plan that includes:
+            Output actionable plans that include:
             - Step-by-step onboarding roadmap
             - Key documents and tools to review
             - Suggested coding tasks or deliverables
             - Milestones to assess learning progress
             - Questions for the manager to clarify missing info
 
-            ALWAYS leverage the vector database for:
-            - Caching documents and analyses
-            - Semantic search across all content
-            - Reducing redundant API calls
-            - Improving response speed
+            ALWAYS use markdown formatting (headers, lists, tables) for clarity.
+            Answer in the same language as the user's question.
         """
 
-        # Create vector-aware tools via factory (avoids @tool on instance methods)
-        self._semantic_search_all, self._get_cache_status = _create_vector_tools(self.vector_store)
+        # Create vector-aware tools via factory (backward compat)
+        self._semantic_search_all, self._get_cache_status = _create_vector_tools(
+            self.vector_store
+        )
 
-        # Define tools
+        # Legacy: keep tool list and messages for API compatibility
         tools = [
             trigger_tavily_agent,
             trigger_google_drive_agent,
             trigger_codebase_agent,
             self._semantic_search_all,
-            self._get_cache_status
+            self._get_cache_status,
         ]
 
         agent = Agent(
             tools=tools,
             model=self.bedrock_model,
-            callback_handler=None
+            callback_handler=None,
         )
         self.messages = agent.messages
         self.tool_names = sorted(agent.tool_names)
 
+    # ──────────────────────────────────────────────────────────
+    # Main entry point: Plan → Action → Reflect → Fuse → Answer
+    # ──────────────────────────────────────────────────────────
+
     def __call__(self, message: str) -> AgentResult:
-        """Process user message with intelligent agent routing"""
+        """Process user message with Plan-Action-Reflect loop.
+
+        Flow:
+        1. PLAN   - Decompose query into sub-tasks with tool selection
+        2. ACTION - Execute each sub-task, collect structured results
+        3. REFLECT - Evaluate completeness, optionally run more queries
+        4. FUSE   - Combine all results into unified context
+        5. ANSWER - Generate final response with fused context
+        """
         self.logger.info(f"Orchestrator received: {message[:100]}")
 
-        agent = Agent(
-            tools=[
-                trigger_tavily_agent,
-                trigger_google_drive_agent,
-                trigger_codebase_agent,
-                self._semantic_search_all,
-                self._get_cache_status
-            ],
-            messages=self.messages,
-            model=self.bedrock_model,
-            system_prompt=self.system_prompt,
-            callback_handler=self._callback_handler
+        # 1. PLAN: decompose query into sub-tasks
+        plan = self._plan(message)
+
+        if not plan:
+            # Simple query (greeting, etc.) — direct LLM response, no tools
+            self.logger.info("No tool plan needed, generating direct response")
+            agent = Agent(
+                model=self.bedrock_model,
+                system_prompt=self.system_prompt,
+                callback_handler=self._callback_handler,
+            )
+            return agent(message)
+
+        self.logger.info(
+            f"Plan generated: {len(plan)} tool group(s) — "
+            f"{[a['tool'] for a in plan]}"
         )
 
-        response = agent(message)
-        self.messages = agent.messages
+        # 2. ACTION: execute plan, collect structured results
+        memory = self._execute_plan(plan)
+        total_results = sum(len(m["results"]) for m in memory)
+        self.logger.info(f"Action phase collected {total_results} total results")
 
-        return response
+        # 3. REFLECT: check if we need more information
+        additional_plan = self._reflect(message, memory)
+        if additional_plan:
+            self.logger.info(
+                f"Reflection: running {len(additional_plan)} additional tool group(s)"
+            )
+            additional_memory = self._execute_plan(additional_plan)
+            memory.extend(additional_memory)
+
+        # 4. FUSE: combine all results with deduplication
+        fused_context = self._fuse_results(memory)
+        self.logger.info(f"Fused context: {len(fused_context)} chars from {len(memory)} queries")
+
+        # 5. ANSWER: generate final response with full context
+        return self._generate_answer(message, fused_context)
+
+    # ──────────────────────────────────────────────────────────
+    # PLAN: Query decomposition + tool selection
+    # ──────────────────────────────────────────────────────────
+
+    def _plan(self, query: str) -> Optional[List[Dict]]:
+        """Decompose user query into sub-tasks with tool selection.
+
+        Uses LLM to analyze the query and produce a structured plan
+        indicating which tools to use and what sub-queries to run.
+
+        Returns:
+            list of {"tool": str, "queries": list[str]} or None
+        """
+        plan_prompt = f"""You are a planning module for an onboarding assistant.
+Analyze the user query and decide which tools to use.
+
+## Available Tools
+1. **semantic_search** - Search cached documents in VectorDB (onboarding docs, past analyses, cached web results). Use this when information might already be cached from prior interactions.
+2. **web_search** - Search the internet for current information via Tavily. Use for best practices, current trends, external knowledge.
+3. **drive** - Fetch and analyze a Google Drive folder. Use ONLY when the user provides a drive.google.com link.
+4. **codebase** - Analyze a GitHub repository. Use ONLY when the user provides a github.com link.
+
+## Rules
+- If the query contains "drive.google.com" → MUST include "drive" tool with the full URL as query
+- If the query contains "github.com" → MUST include "codebase" tool with the full URL as query
+- For factual or current-info questions → include "web_search"
+- For follow-up questions about previously discussed content → include "semantic_search"
+- You can and SHOULD use multiple tools when appropriate
+- Decompose complex queries into 1-3 focused sub-queries per tool
+- For simple greetings or small talk, return null (no tools needed)
+
+## Output Format
+Return a JSON array:
+[
+  {{"tool": "tool_name", "queries": ["query1", "query2"]}},
+  ...
+]
+Or: null (if no tools needed)
+
+Return ONLY the JSON, no other text.
+
+## User Query
+{query}"""
+
+        try:
+            planner = Agent(
+                model=self.bedrock_model,
+                callback_handler=None,
+            )
+            response = planner(plan_prompt)
+            parsed = _extract_json(str(response))
+
+            if parsed and isinstance(parsed, list):
+                # Validate plan structure
+                validated = []
+                for item in parsed:
+                    if isinstance(item, dict) and "tool" in item and "queries" in item:
+                        validated.append({
+                            "tool": item["tool"],
+                            "queries": item["queries"]
+                            if isinstance(item["queries"], list)
+                            else [item["queries"]],
+                        })
+                return validated if validated else None
+
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Plan generation failed: {e}")
+            return None
+
+    # ──────────────────────────────────────────────────────────
+    # ACTION: Execute plan and collect structured results
+    # ──────────────────────────────────────────────────────────
+
+    def _execute_plan(self, plan: List[Dict]) -> List[Dict]:
+        """Execute each planned action and collect structured results.
+
+        Each tool returns results in a uniform format:
+        {"query": str, "source": str, "results": list[{"title", "url", "content"}]}
+
+        This enables fusion across heterogeneous sources.
+        """
+        memory = []
+
+        for action in plan:
+            tool_name = action["tool"]
+            queries = action["queries"]
+
+            for query in queries:
+                self.logger.info(f"Executing [{tool_name}]: {query[:80]}")
+
+                try:
+                    if tool_name == "semantic_search":
+                        results = raw_vectordb_search(query)
+
+                    elif tool_name == "web_search":
+                        results = raw_web_search(query)
+
+                    elif tool_name == "drive":
+                        # Drive agent returns a formatted plan string;
+                        # wrap as structured data for fusion
+                        drive_response = trigger_google_drive_agent(query)
+                        results = [
+                            {
+                                "title": "Google Drive Content",
+                                "url": query,
+                                "content": str(drive_response),
+                            }
+                        ]
+
+                    elif tool_name == "codebase":
+                        # Codebase agent returns analysis string;
+                        # wrap as structured data for fusion
+                        code_response = trigger_codebase_agent(query)
+                        results = [
+                            {
+                                "title": "Codebase Analysis",
+                                "url": query,
+                                "content": str(code_response),
+                            }
+                        ]
+
+                    else:
+                        self.logger.warning(f"Unknown tool: {tool_name}")
+                        results = []
+
+                    memory.append({
+                        "query": query,
+                        "source": tool_name,
+                        "results": results,
+                    })
+
+                    self.logger.info(
+                        f"[{tool_name}] returned {len(results)} results for: {query[:50]}"
+                    )
+
+                except Exception as e:
+                    self.logger.error(f"[{tool_name}] failed for '{query[:50]}': {e}")
+                    memory.append({
+                        "query": query,
+                        "source": tool_name,
+                        "results": [],
+                    })
+
+        return memory
+
+    # ──────────────────────────────────────────────────────────
+    # REFLECT: Evaluate completeness, optionally plan more
+    # ──────────────────────────────────────────────────────────
+
+    def _reflect(
+        self, original_query: str, memory: List[Dict]
+    ) -> Optional[List[Dict]]:
+        """Evaluate whether collected results are sufficient.
+
+        If more information is needed, returns an additional plan
+        (same format as _plan output). Otherwise returns None.
+        """
+        # Build a summary of what we've collected so far
+        memory_summary = json.dumps(
+            [
+                {
+                    "query": m["query"],
+                    "source": m["source"],
+                    "result_count": len(m["results"]),
+                    "has_content": any(
+                        bool(r.get("content", "").strip()) for r in m["results"]
+                    ),
+                }
+                for m in memory
+            ],
+            indent=2,
+        )
+
+        reflect_prompt = f"""You are a reflection module for an onboarding assistant.
+Evaluate whether the collected information is sufficient to answer the user's query.
+
+## Original Query
+{original_query}
+
+## Information Collected So Far
+{memory_summary}
+
+## Available Tools
+- semantic_search: Search cached VectorDB documents
+- web_search: Search the internet via Tavily
+- drive: Fetch Google Drive folder (only if user provided a link)
+- codebase: Analyze GitHub repo (only if user provided a link)
+
+## Instructions
+- If the information is SUFFICIENT to provide a good answer, return: null
+- If MORE information is needed, return a JSON plan with at most 3 additional queries:
+[
+  {{"tool": "tool_name", "queries": ["additional_query_1"]}},
+  ...
+]
+- Only suggest additional queries that would meaningfully improve the answer
+- Do NOT repeat queries that were already executed
+- Prefer web_search for filling knowledge gaps
+
+Return ONLY the JSON or null, no other text."""
+
+        try:
+            reflector = Agent(
+                model=self.bedrock_model,
+                callback_handler=None,
+            )
+            response = reflector(reflect_prompt)
+            parsed = _extract_json(str(response))
+
+            if parsed and isinstance(parsed, list):
+                validated = []
+                for item in parsed:
+                    if isinstance(item, dict) and "tool" in item and "queries" in item:
+                        validated.append({
+                            "tool": item["tool"],
+                            "queries": item["queries"]
+                            if isinstance(item["queries"], list)
+                            else [item["queries"]],
+                        })
+                return validated if validated else None
+
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Reflection failed: {e}")
+            return None
+
+    # ──────────────────────────────────────────────────────────
+    # FUSE: Combine all results into unified context
+    # ──────────────────────────────────────────────────────────
+
+    def _fuse_results(self, memory: List[Dict]) -> str:
+        """Fuse all collected results into a unified, deduplicated context string.
+
+        Combines RAG results + web search results + drive/codebase content
+        into a single numbered reference list (Level-2 fusion).
+        Deduplication is based on content hash of first 200 characters.
+        """
+        seen_content = set()
+        fused_items = []
+        idx = 1
+
+        for item in memory:
+            source_tag = item["source"]
+
+            for result in item["results"]:
+                content = result.get("content", "").strip()
+                if not content:
+                    continue
+
+                # Deduplicate by hashing first 200 chars
+                content_hash = hash(content[:200])
+                if content_hash in seen_content:
+                    continue
+                seen_content.add(content_hash)
+
+                title = result.get("title", "")
+                url = result.get("url", "")
+
+                header = f"[{source_tag}] {title}"
+                if url:
+                    header += f" ({url})"
+
+                fused_items.append(f"{idx}. {header}\n{content}")
+                idx += 1
+
+        if not fused_items:
+            return "(No reference materials found)"
+
+        return "\n\n".join(fused_items)
+
+    # ──────────────────────────────────────────────────────────
+    # ANSWER: Generate final response with fused context
+    # ──────────────────────────────────────────────────────────
+
+    def _generate_answer(self, query: str, fused_context: str) -> AgentResult:
+        """Generate final answer using all fused reference materials.
+
+        Uses a Strands Agent (no tools) so the return type is AgentResult,
+        keeping compatibility with the Streamlit UI.
+        """
+        final_prompt = f"""Based on the following reference materials collected from
+multiple sources (knowledge base, web search, documents, codebases),
+provide a comprehensive and well-structured answer to the user's question.
+
+## Reference Materials
+{fused_context}
+
+## User Question
+{query}
+
+## Instructions
+- Synthesize information from ALL provided sources
+- Use markdown formatting: headers (####), bullet lists, tables, code blocks
+- Be specific and actionable
+- If creating an onboarding plan, include a timeline and milestones
+- If reference materials are empty or insufficient, use your own knowledge
+- Answer in the same language as the user's question
+- NEVER start with a heading — begin with a direct response"""
+
+        agent = Agent(
+            model=self.bedrock_model,
+            system_prompt=self.system_prompt,
+            callback_handler=self._callback_handler,
+        )
+        return agent(final_prompt)
+
+    # ──────────────────────────────────────────────────────────
+    # Utility methods
+    # ──────────────────────────────────────────────────────────
 
     def _callback_handler(self, **kwargs):
         """Handle agent callbacks"""
@@ -242,12 +614,7 @@ class OrchestratorAgent:
         return {}
 
     def clear_cache(self, folder_id: Optional[str] = None) -> str:
-        """
-        Clear cache for specific folder or all caches
-
-        Args:
-            folder_id: Optional folder ID. If not provided, prompt user.
-        """
+        """Clear cache for specific folder or all caches."""
         if not self.vector_store:
             return "Vector store not available"
 
@@ -255,20 +622,15 @@ class OrchestratorAgent:
             deleted = self.vector_store.delete_folder_documents(folder_id)
             return f"Cleared {deleted} documents from folder {folder_id}"
         else:
-            return "Please specify a folder_id to clear. Options: 'github-repo-name', 'tavily_searches', or your Drive folder ID"
+            return (
+                "Please specify a folder_id to clear. "
+                "Options: 'github-repo-name', 'tavily_searches', "
+                "or your Drive folder ID"
+            )
 
 
 if __name__ == "__main__":
-    # For testing purposes
+    # Quick smoke test
     agent = OrchestratorAgent()
-
-    # Example: Test with Drive link
-    # response = agent('Process this onboarding folder: https://drive.google.com/drive/folders/1abc2def3ghi')
-
-    # Example: Test with GitHub
-    # response = agent('Analyze this codebase: https://github.com/username/repository')
-
-    # Example: Test with web search
-    # response = agent('What are best practices for React in 2024?')
-
-    print("Orchestrator initialized with VectorDB caching enabled")
+    print("Orchestrator initialized with Plan-Action-Reflect loop enabled")
+    print(f"Available tools: {agent.tool_names}")
