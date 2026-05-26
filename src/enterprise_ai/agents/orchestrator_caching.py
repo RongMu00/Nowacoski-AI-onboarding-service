@@ -18,7 +18,7 @@ from enterprise_ai.agents.tools_caching import (
     trigger_slack_agent,
     trigger_tavily_agent,
 )
-from enterprise_ai.storage.vector_store import MongoVectorStore
+from enterprise_ai.storage.vector_store import get_vector_store, MongoVectorStore
 
 dotenv.load_dotenv()
 
@@ -172,9 +172,9 @@ class OrchestratorAgent:
             )
         )
 
-        # Initialize VectorDB for orchestration memory
+        # Initialize VectorDB singleton for orchestration memory
         try:
-            self.vector_store = MongoVectorStore()
+            self.vector_store = get_vector_store()
             self.logger.info("Vector store initialized for orchestrator")
         except Exception as e:
             self.logger.warning(f"Vector store not available: {e}")
@@ -273,7 +273,7 @@ class OrchestratorAgent:
         )
 
         # 2. ACTION: execute plan, collect structured results
-        memory = self._execute_plan(plan)
+        memory = self._execute_plan(plan, user_query=message)
         total_results = sum(len(m["results"]) for m in memory)
         self.logger.info(f"Action phase collected {total_results} total results")
 
@@ -283,7 +283,7 @@ class OrchestratorAgent:
             self.logger.info(
                 f"Reflection: running {len(additional_plan)} additional tool group(s)"
             )
-            additional_memory = self._execute_plan(additional_plan)
+            additional_memory = self._execute_plan(additional_plan, user_query=message)
             memory.extend(additional_memory)
 
         # 4. FUSE: combine all results with deduplication
@@ -317,8 +317,10 @@ Analyze the user query and decide which tools to use.
 5. **slack** - Fetch and analyze Slack channel messages. Use ONLY when the user provides a Slack channel ID (e.g., "C0123456789") or mentions Slack.
 
 ## Rules
-- If the query contains "drive.google.com" → MUST include "drive" tool with the full URL as query
-- If the query contains "github.com" → MUST include "codebase" tool with the full URL as query
+- If the query contains an actual URL starting with "drive.google.com/drive/folders/" → MUST include "drive" tool with the full URL as query
+- If the query merely *mentions* "Google Drive" or "drive" without an actual drive.google.com URL → do NOT use "drive" tool. Use "semantic_search" instead to look up previously cached Drive content.
+- If the query contains an actual URL starting with "github.com/" → MUST include "codebase" tool with the full URL as query
+- If the query merely *mentions* "GitHub" or a repository without an actual github.com URL → do NOT use "codebase" tool. Use "semantic_search" instead.
 - If the query mentions a Slack channel ID (C followed by digits/letters) → MUST include "slack" tool
 - For factual or current-info questions → include "web_search"
 - For follow-up questions about previously discussed content → include "semantic_search"
@@ -370,13 +372,18 @@ Return ONLY the JSON, no other text.
     # ACTION: Execute plan and collect structured results
     # ──────────────────────────────────────────────────────────
 
-    def _execute_plan(self, plan: List[Dict]) -> List[Dict]:
+    def _execute_plan(self, plan: List[Dict], user_query: str = None) -> List[Dict]:
         """Execute each planned action and collect structured results.
 
         Each tool returns results in a uniform format:
         {"query": str, "source": str, "results": list[{"title", "url", "content"}]}
 
         This enables fusion across heterogeneous sources.
+
+        Args:
+            plan: List of planned actions with tool names and queries.
+            user_query: The user's original question. Passed to codebase agent
+                       for hybrid cache + targeted file fetching.
         """
         memory = []
 
@@ -408,8 +415,11 @@ Return ONLY the JSON, no other text.
 
                     elif tool_name == "codebase":
                         # Codebase agent returns analysis string;
-                        # wrap as structured data for fusion
-                        code_response = trigger_codebase_agent(query)
+                        # wrap as structured data for fusion.
+                        # Pass user_query for hybrid cache + targeted fetch.
+                        code_response = trigger_codebase_agent(
+                            query, query=user_query
+                        )
                         results = [
                             {
                                 "title": "Codebase Analysis",
@@ -484,11 +494,11 @@ Evaluate whether the collected information is sufficient to answer the user's qu
 {memory_summary}
 
 ## Available Tools
-- semantic_search: Search cached VectorDB documents
+- semantic_search: Search cached VectorDB documents (use for follow-up questions about previously fetched content)
 - web_search: Search the internet via Tavily
-- drive: Fetch Google Drive folder (only if user provided a link)
-- codebase: Analyze GitHub repo (only if user provided a link)
-- slack: Fetch Slack channel messages (only if user provided a channel ID)
+- drive: Fetch Google Drive folder (ONLY if the original query contains a drive.google.com URL — never for follow-up questions)
+- codebase: Analyze GitHub repo (ONLY if the original query contains a github.com URL — never for follow-up questions)
+- slack: Fetch Slack channel messages (only if user provided a Slack channel ID)
 
 ## Instructions
 - If the information is SUFFICIENT to provide a good answer, return: null

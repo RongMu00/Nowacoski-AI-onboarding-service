@@ -5,8 +5,8 @@ from typing import Dict, List, Optional
 from strands import Agent
 from strands.models import BedrockModel
 
-# Import VectorDB for caching
-from enterprise_ai.storage.vector_store import MongoVectorStore
+# Import VectorDB singleton for caching
+from enterprise_ai.storage.vector_store import get_vector_store
 
 logger = logging.getLogger("slack_agent")
 
@@ -73,9 +73,9 @@ class SlackAgent:
             build a better onboarding plan.
         """
 
-        # Initialize VectorDB for caching
+        # Initialize VectorDB singleton for caching
         try:
-            self.vector_store = MongoVectorStore()
+            self.vector_store = get_vector_store()
             self.logger.info("Vector store initialized for Slack caching")
         except Exception as e:
             self.logger.warning(f"Vector store not available: {e}")

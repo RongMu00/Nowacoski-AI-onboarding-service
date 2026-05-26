@@ -5,8 +5,8 @@ from typing import Dict, List, Optional
 from github import Github
 from strands import Agent
 
-# Import VectorDB for caching
-from enterprise_ai.storage.vector_store import MongoVectorStore
+# Import VectorDB singleton for caching
+from enterprise_ai.storage.vector_store import get_vector_store
 
 logger = logging.getLogger("codebase_agent")
 
@@ -30,9 +30,9 @@ class CodebaseAgent:
         self.github = Github(github_token)
         self.agent = Agent(system_prompt=self._get_system_prompt())
 
-        # NEW: Initialize VectorDB for caching
+        # Initialize VectorDB singleton for caching
         try:
-            self.vector_store = MongoVectorStore()
+            self.vector_store = get_vector_store()
             self.logger.info("Vector store initialized for codebase caching")
         except Exception as e:
             self.logger.warning(f"Vector store not available: {e}")
@@ -48,8 +48,16 @@ class CodebaseAgent:
 
         Format your response as a structured list with clear sections."""
 
-    def create_onboarding_plan(self, repo_url: str) -> str:
-        """Create onboarding plan from GitHub repository with VectorDB caching"""
+    def create_onboarding_plan(self, repo_url: str, query: str = None) -> str:
+        """Create onboarding plan from GitHub repository with VectorDB caching.
+
+        Args:
+            repo_url: GitHub repository URL
+            query: Optional specific question about the repo. When provided
+                   and a cached analysis exists, the agent checks whether the
+                   cache covers the question. If not, it fetches targeted files
+                   from GitHub to supplement the cached analysis (hybrid mode).
+        """
         try:
             # Extract repo information from URL
             repo_name = repo_url.split('github.com/')[-1].strip('/')
@@ -61,10 +69,41 @@ class CodebaseAgent:
             cached_content = self._get_cached_repo_content(repo_id)
 
             if cached_content:
-                self.logger.info(f"Using cached analysis from VectorDB")
-                return self._format_cached_response(cached_content, repo_name, True)
+                # If no specific query, return cached analysis (fast path)
+                if not query:
+                    self.logger.info("Using cached analysis from VectorDB")
+                    return self._format_cached_response(cached_content, repo_name, True)
 
-            # STEP 2: Fetch from GitHub
+                # Hybrid mode: check if cache covers the specific question
+                relevance = self._check_cache_relevance(cached_content, query)
+                self.logger.info(
+                    f"Cache relevance to query: {relevance:.0%} (threshold: 50%)"
+                )
+
+                if relevance >= 0.5:
+                    self.logger.info("Cached analysis covers the question — using cache")
+                    return self._format_cached_response(cached_content, repo_name, True)
+
+                # Cache doesn't cover this question — fetch targeted files
+                self.logger.info(
+                    "Cached analysis insufficient for this question — "
+                    "fetching targeted files from GitHub"
+                )
+                repo = self.github.get_repo(repo_name)
+                targeted_content = self._fetch_targeted_files(repo, query)
+
+                if targeted_content:
+                    # Generate focused answer combining cache + targeted files
+                    return self._generate_targeted_answer(
+                        repo_name, repo_url, repo_id,
+                        cached_content, targeted_content, query
+                    )
+                else:
+                    # Couldn't find relevant files — fall back to cached analysis
+                    self.logger.info("No targeted files found — using cached analysis")
+                    return self._format_cached_response(cached_content, repo_name, True)
+
+            # STEP 2: Fetch from GitHub (no cache exists at all)
             self.logger.info("Fetching repository data from GitHub...")
             repo = self.github.get_repo(repo_name)
 
@@ -100,7 +139,7 @@ class CodebaseAgent:
             response = self.agent(prompt)
             response_text = str(response)
 
-            # STEP 4: Cache the analysis
+            # STEP 4: Cache the generic analysis
             if self.vector_store:
                 doc_id = self.vector_store.store_document(
                     content=response_text,
@@ -117,6 +156,18 @@ class CodebaseAgent:
 
                 if doc_id:
                     self.logger.info(f"Cached codebase analysis: {doc_id}")
+
+            # STEP 5: If user asked a specific question, also fetch targeted files
+            if query:
+                self.logger.info(
+                    "First fetch + specific query — fetching targeted files too"
+                )
+                targeted_content = self._fetch_targeted_files(repo, query)
+                if targeted_content:
+                    return self._generate_targeted_answer(
+                        repo_name, repo_url, repo_id,
+                        response_text, targeted_content, query
+                    )
 
             return self._format_response(response_text, repo_name, False)
 
@@ -142,6 +193,176 @@ class CodebaseAgent:
         except Exception as e:
             self.logger.warning(f"Could not retrieve cached repo: {e}")
             return None
+
+    def _check_cache_relevance(self, cached_content: str, query: str) -> float:
+        """Check how well the cached analysis covers the specific question.
+
+        Uses VectorDB semantic similarity between the query and cached content.
+        Returns a similarity score between 0.0 and 1.0.
+        """
+        if not self.vector_store:
+            return 0.0
+
+        try:
+            results = self.vector_store.search_similar(
+                query=query, top_k=1, threshold=0.0
+            )
+            if results:
+                return results[0].get('similarity', 0.0)
+            return 0.0
+        except Exception as e:
+            self.logger.warning(f"Relevance check failed: {e}")
+            return 0.0
+
+    def _fetch_targeted_files(self, repo, query: str) -> List[Dict]:
+        """Fetch specific files from GitHub that are relevant to the query.
+
+        Uses GitHub code search to find files matching query keywords,
+        then fetches their content. Returns list of {name, path, content}.
+        """
+        targeted = []
+
+        try:
+            # Extract keywords from query for file search
+            stop_words = {
+                'what', 'does', 'the', 'how', 'is', 'in', 'a', 'an', 'for',
+                'to', 'of', 'this', 'that', 'do', 'can', 'you', 'explain',
+                'about', 'tell', 'me', 'file', 'code', 'function', 'class',
+            }
+            keywords = [
+                w for w in query.lower().split()
+                if w not in stop_words and len(w) > 2
+            ]
+
+            if not keywords:
+                return []
+
+            search_query = ' '.join(keywords[:4])  # Limit to top 4 keywords
+            self.logger.info(f"Searching repo for: {search_query}")
+
+            # Search for files using GitHub code search
+            try:
+                code_results = self.github.search_code(
+                    query=f"{search_query} repo:{repo.full_name}",
+                )
+                for item in list(code_results)[:5]:  # Top 5 matching files
+                    try:
+                        file_content = repo.get_contents(item.path)
+                        decoded = file_content.decoded_content.decode(
+                            'utf-8', errors='ignore'
+                        )
+                        # Limit per file to avoid token explosion
+                        targeted.append({
+                            'name': item.name,
+                            'path': item.path,
+                            'content': decoded[:3000],
+                        })
+                        self.logger.info(f"Fetched targeted file: {item.path}")
+                    except Exception as e:
+                        self.logger.warning(f"Could not read {item.path}: {e}")
+            except Exception as e:
+                self.logger.warning(f"GitHub code search failed: {e}")
+
+            # Also try to find files by walking directories for keyword matches
+            if not targeted:
+                self.logger.info("Code search empty — scanning repo tree")
+                try:
+                    tree = repo.get_git_tree(sha="HEAD", recursive=True).tree
+                    for entry in tree:
+                        if entry.type != 'blob':
+                            continue
+                        path_lower = entry.path.lower()
+                        if any(kw in path_lower for kw in keywords):
+                            try:
+                                file_content = repo.get_contents(entry.path)
+                                decoded = file_content.decoded_content.decode(
+                                    'utf-8', errors='ignore'
+                                )
+                                targeted.append({
+                                    'name': entry.path.split('/')[-1],
+                                    'path': entry.path,
+                                    'content': decoded[:3000],
+                                })
+                                self.logger.info(
+                                    f"Fetched matching file: {entry.path}"
+                                )
+                                if len(targeted) >= 5:
+                                    break
+                            except Exception:
+                                continue
+                except Exception as e:
+                    self.logger.warning(f"Tree scan failed: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Targeted file fetch error: {e}")
+
+        self.logger.info(f"Fetched {len(targeted)} targeted files")
+        return targeted
+
+    def _generate_targeted_answer(
+        self,
+        repo_name: str,
+        repo_url: str,
+        repo_id: str,
+        cached_analysis: str,
+        targeted_files: List[Dict],
+        query: str,
+    ) -> str:
+        """Generate a focused answer combining cached analysis + targeted files.
+
+        Uses the LLM to synthesize the high-level cached analysis with
+        specific file contents to answer the user's detailed question.
+        """
+        # Format targeted file content
+        files_text = ""
+        for f in targeted_files:
+            files_text += f"\n--- {f['path']} ---\n{f['content']}\n"
+
+        prompt = f"""You have a cached high-level analysis of a repository AND
+specific file contents fetched because the cached analysis didn't fully cover
+the user's question. Synthesize both to provide a detailed, accurate answer.
+
+## Cached Repository Analysis (high-level)
+{cached_analysis[:2000]}
+
+## Targeted File Contents (fetched for this specific question)
+{files_text}
+
+## User's Question
+{query}
+
+## Instructions
+- Focus on answering the specific question using the targeted file contents
+- Use the cached analysis for overall context
+- Be specific — reference actual code, functions, classes from the files
+- Use markdown formatting with code blocks where relevant
+"""
+
+        response = self.agent(prompt)
+        response_text = str(response)
+
+        # Cache this targeted analysis too
+        if self.vector_store:
+            doc_id = self.vector_store.store_document(
+                content=response_text,
+                source=f"Targeted: {repo_name} — {query[:60]}",
+                folder_id=f"github-{repo_id}",
+                metadata={
+                    "type": "codebase_targeted_analysis",
+                    "repo_url": repo_url,
+                    "repo_name": repo_name,
+                    "query": query,
+                    "files_analyzed": [f['path'] for f in targeted_files],
+                },
+            )
+            if doc_id:
+                self.logger.info(f"Cached targeted analysis: {doc_id}")
+
+        output = f"📦 **Codebase Deep Dive: {repo_name}**\n\n"
+        output += f"🔍 *Targeted analysis — fetched {len(targeted_files)} "
+        output += "specific files to answer your question*\n\n"
+        output += response_text
+        return output
 
     def _get_readme(self, repo) -> str:
         """Get repository README content"""

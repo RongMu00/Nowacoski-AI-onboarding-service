@@ -10,11 +10,39 @@ from enterprise_ai.agents.codebase_agent_caching import CodebaseAgent
 from enterprise_ai.agents.drive_agent_caching import DriveAgent
 from enterprise_ai.agents.slack_agent_caching import SlackAgent
 from enterprise_ai.agents.tavily_agent_caching import TavilyAgent
-from enterprise_ai.storage.vector_store import MongoVectorStore
+from enterprise_ai.storage.vector_store import MongoVectorStore, get_vector_store
 
 dotenv.load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────
+# Lazy singletons — avoid re-creating expensive objects
+# (MongoDB connection + embedding model + MCP client) on every call
+# ──────────────────────────────────────────────────────────────
+
+_tavily_agent: Optional[TavilyAgent] = None
+_slack_agent: Optional[SlackAgent] = None
+
+
+def _get_tavily_agent() -> TavilyAgent:
+    global _tavily_agent
+    if _tavily_agent is None:
+        _tavily_agent = TavilyAgent()
+    return _tavily_agent
+
+
+def _get_slack_agent() -> SlackAgent:
+    global _slack_agent
+    if _slack_agent is None:
+        _slack_agent = SlackAgent()
+    return _slack_agent
+
+
+def _get_vector_store() -> MongoVectorStore:
+    """Use the shared singleton from vector_store.py — no duplicate connections."""
+    return get_vector_store()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -31,7 +59,7 @@ def raw_web_search(query: str) -> List[Dict]:
     """
     logger.info(f"Raw web search: {query[:60]}")
     try:
-        agent = TavilyAgent()
+        agent = _get_tavily_agent()
         return agent.search_raw(query)
     except Exception as e:
         logger.error(f"Raw web search error: {e}")
@@ -46,7 +74,7 @@ def raw_slack_search(channel_id: str, limit: int = 50) -> List[Dict]:
     """
     logger.info(f"Raw Slack search: channel {channel_id}")
     try:
-        agent = SlackAgent()
+        agent = _get_slack_agent()
         return agent.search_raw(channel_id, limit)
     except Exception as e:
         logger.error(f"Raw Slack search error: {e}")
@@ -61,8 +89,8 @@ def raw_vectordb_search(query: str, folder_id: Optional[str] = None) -> List[Dic
     """
     logger.info(f"Raw VectorDB search: {query[:60]}")
     try:
-        vector_store = MongoVectorStore()
-        results = vector_store.search_similar(
+        store = _get_vector_store()
+        results = store.search_similar(
             query=query, folder_id=folder_id, top_k=5, threshold=0.3
         )
         return [
@@ -100,7 +128,7 @@ def trigger_tavily_agent(context: str) -> str:
     logger.info(f"🌐 Tavily search triggered: {context[:50]}")
 
     try:
-        agent = TavilyAgent()
+        agent = _get_tavily_agent()
         response = agent(context)
         logger.info("✅ Tavily search completed")
         return str(response)
@@ -176,29 +204,39 @@ def trigger_google_drive_agent(drive_links: str) -> str:
 
 
 @tool
-def trigger_codebase_agent(repo_url: str) -> str:
+def trigger_codebase_agent(repo_url: str, query: str = None) -> str:
     """
-    Triggers the Codebase Agent with VectorDB caching.
+    Triggers the Codebase Agent with VectorDB caching and hybrid deep-dive.
 
     Features:
     - Analyzes GitHub repositories for developer onboarding
     - Caches analysis results in MongoDB
     - Returns cached results for repeated queries
     - Extracts technologies, setup steps, and learning paths
+    - Hybrid mode: when a specific query is provided and the cached analysis
+      doesn't cover it, fetches targeted files from GitHub for a deeper answer
 
     Args:
         repo_url (str): GitHub repository URL
                        Format: https://github.com/username/repository
+        query (str, optional): Specific question about the repo.
+                              When provided, enables hybrid cache + targeted fetch.
 
     Returns:
-        str: Structured onboarding plan for the codebase
+        str: Structured onboarding plan or targeted analysis for the codebase
 
     Example:
         >>> trigger_codebase_agent(
         ...     'https://github.com/facebook/react'
         ... )
+        >>> trigger_codebase_agent(
+        ...     'https://github.com/facebook/react',
+        ...     query='How does the fiber reconciliation algorithm work?'
+        ... )
     """
     logger.info(f"📦 Codebase agent triggered: {repo_url}")
+    if query:
+        logger.info(f"   Specific query: {query[:80]}")
 
     try:
         github_token = os.getenv('GITHUB_TOKEN')
@@ -209,7 +247,7 @@ def trigger_codebase_agent(repo_url: str) -> str:
         agent = CodebaseAgent(github_token)
         logger.info("✅ CodebaseAgent initialized")
 
-        onboarding = agent.create_onboarding_plan(repo_url)
+        onboarding = agent.create_onboarding_plan(repo_url, query=query)
         logger.info("✅ Codebase analysis completed")
 
         return str(onboarding)
@@ -242,7 +280,7 @@ def trigger_slack_agent(channel_id: str) -> str:
     logger.info(f"💬 Slack agent triggered: {channel_id}")
 
     try:
-        agent = SlackAgent()
+        agent = _get_slack_agent()
         response = agent(channel_id)
         logger.info("✅ Slack analysis completed")
         return str(response)
@@ -276,7 +314,7 @@ def semantic_search_vectordb(query: str, folder_id: Optional[str] = None) -> str
     logger.info(f"🔍 Semantic search: {query}")
 
     try:
-        vector_store = MongoVectorStore()
+        vector_store = _get_vector_store()
 
         results = vector_store.search_similar(
             query=query,
@@ -385,8 +423,8 @@ def _format_error_response(title: str, message: str) -> str:
 def get_vectordb_stats() -> dict:
     """Get MongoDB VectorDB statistics"""
     try:
-        vector_store = MongoVectorStore()
-        return vector_store.get_stats()
+        store = _get_vector_store()
+        return store.get_stats()
     except Exception as e:
         logger.warning(f"Could not get VectorDB stats: {e}")
         return {}
@@ -396,8 +434,8 @@ def get_vectordb_stats() -> dict:
 def clear_vectordb_cache(folder_id: str) -> int:
     """Clear VectorDB cache for specific folder"""
     try:
-        vector_store = MongoVectorStore()
-        deleted = vector_store.delete_folder_documents(folder_id)
+        store = _get_vector_store()
+        deleted = store.delete_folder_documents(folder_id)
         logger.info(f"Cleared {deleted} documents from {folder_id}")
         return deleted
     except Exception as e:

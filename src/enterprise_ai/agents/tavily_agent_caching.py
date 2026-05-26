@@ -8,8 +8,8 @@ from strands.agent.agent_result import AgentResult
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
 
-# Import VectorDB for caching
-from enterprise_ai.storage.vector_store import MongoVectorStore
+# Import VectorDB singleton for caching
+from enterprise_ai.storage.vector_store import get_vector_store
 
 logger = logging.getLogger("tavily_agent")
 
@@ -44,9 +44,9 @@ class TavilyAgent:
             Return structured, useful output to help the orchestrator onboard the employee more effectively.
         """
 
-        # NEW: Initialize VectorDB for caching search results
+        # Initialize VectorDB singleton for caching search results
         try:
-            self.vector_store = MongoVectorStore()
+            self.vector_store = get_vector_store()
             self.logger.info("Vector store initialized for search caching")
         except Exception as e:
             self.logger.warning(f"Vector store not available: {e}")

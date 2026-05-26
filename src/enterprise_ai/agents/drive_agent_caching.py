@@ -8,8 +8,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from strands import Agent
 
-# Import VectorDB for caching
-from enterprise_ai.storage.vector_store import MongoVectorStore
+# Import VectorDB singleton for caching
+from enterprise_ai.storage.vector_store import get_vector_store
 
 logger = logging.getLogger("drive_agent")
 
@@ -61,9 +61,9 @@ class DriveAgent:
 
         self.agent = Agent(system_prompt=self._get_system_prompt())
 
-        # NEW: Initialize VectorDB for caching
+        # Initialize VectorDB singleton for caching
         try:
-            self.vector_store = MongoVectorStore()
+            self.vector_store = get_vector_store()
             self.logger.info("Vector store initialized for caching")
         except Exception as e:
             self.logger.warning(f"Vector store not available: {e}")
