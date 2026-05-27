@@ -5,11 +5,7 @@ FROM python:3.13-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    RUNNING_LOCAL=false
-
-# Create app user
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Set work directory
 WORKDIR /app
@@ -27,24 +23,24 @@ RUN pip install uv
 # Copy dependency files
 COPY pyproject.toml uv.lock ./
 
-# Install Python dependencies
-RUN uv pip install --system --no-cache-dir -e .
+# Install Python dependencies (including sentence-transformers)
+RUN uv pip install --system --no-cache-dir -e . \
+    && uv pip install --system --no-cache-dir sentence-transformers
 
 # Copy application code
 COPY src/ src/
+COPY .streamlit/ .streamlit/
 
-# Change ownership of the app directory
-RUN chown -R appuser:appuser /app
+# Expose Streamlit port
+EXPOSE 8501
 
-# Switch to app user
-USER appuser
+# Health check against Streamlit's built-in health endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8501/_stcore/health || exit 1
 
-# Expose port
-EXPOSE 8080
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080 || exit 1
-
-# Run the application
-CMD ["streamlit", "run", "src/enterprise_ai/ui.py", "--server.address=0.0.0.0", "--server.port=8080"]
+# Run Streamlit
+CMD ["streamlit", "run", "src/enterprise_ai/ui.py", \
+     "--server.address=0.0.0.0", \
+     "--server.port=8501", \
+     "--server.headless=true", \
+     "--browser.gatherUsageStats=false"]
