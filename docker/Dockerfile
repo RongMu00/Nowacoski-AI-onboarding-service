@@ -20,15 +20,13 @@ RUN apt-get update \
 # Install uv
 RUN pip install uv
 
-# Copy dependency files + README (required by hatchling build)
+# Copy everything needed for install
 COPY pyproject.toml uv.lock README.md ./
-
-# Install Python dependencies (including sentence-transformers)
-RUN uv pip install --system --no-cache-dir -e . \
-    && uv pip install --system --no-cache-dir sentence-transformers
-
-# Copy application code
 COPY src/ src/
+
+# Install the package (non-editable) + sentence-transformers
+RUN uv pip install --system --no-cache-dir . \
+    && uv pip install --system --no-cache-dir sentence-transformers
 COPY .streamlit/ .streamlit/
 
 # Expose Streamlit port
