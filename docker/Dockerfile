@@ -20,8 +20,8 @@ RUN apt-get update \
 # Install uv
 RUN pip install uv
 
-# Copy dependency files
-COPY pyproject.toml uv.lock ./
+# Copy dependency files + README (required by hatchling build)
+COPY pyproject.toml uv.lock README.md ./
 
 # Install Python dependencies (including sentence-transformers)
 RUN uv pip install --system --no-cache-dir -e . \
