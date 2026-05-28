@@ -48,6 +48,7 @@ dependencies = [
     "slack-sdk>=3.27.0",
     "pymongo>=4.6.0",
     "python-dotenv>=1.0.0",
+    "temporalio>=1.9.0",
 ]
 
 [project.optional-dependencies]

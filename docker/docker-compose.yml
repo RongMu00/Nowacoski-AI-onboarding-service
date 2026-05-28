@@ -1,4 +1,56 @@
 services:
+  # ── PostgreSQL for Temporal ────────────────────────────────────
+  temporal-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    volumes:
+      - temporal-db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # ── Temporal server ────────────────────────────────────────────
+  temporal:
+    image: temporalio/auto-setup:latest
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-db
+    depends_on:
+      - temporal-db
+    restart: unless-stopped
+
+  # ── Temporal Web UI (debugging / observability) ────────────────
+  temporal-ui:
+    image: temporalio/ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    depends_on:
+      - temporal
+    restart: unless-stopped
+
+  # ── Temporal worker (batch onboarding) ─────────────────────────
+  temporal-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["python", "-m", "enterprise_ai.batch.worker"]
+    env_file:
+      - ../.env
+    environment:
+      - TEMPORAL_HOST=temporal:7233
+    depends_on:
+      - temporal
+    restart: unless-stopped
+
+  # ── Streamlit app ──────────────────────────────────────────────
   nowacoski:
     build:
       context: ..
@@ -7,6 +59,10 @@ services:
       - "8501:8501"
     env_file:
       - ../.env
+    environment:
+      - TEMPORAL_HOST=temporal:7233
+    depends_on:
+      - temporal
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
@@ -14,3 +70,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+
+volumes:
+  temporal-db-data:

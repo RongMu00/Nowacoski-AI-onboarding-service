@@ -24,6 +24,10 @@ RUN pip install uv
 COPY pyproject.toml uv.lock README.md ./
 COPY src/ src/
 
+# Install CPU-only PyTorch first (avoids downloading ~2GB NVIDIA CUDA libs)
+RUN uv pip install --system --no-cache-dir \
+    torch --index-url https://download.pytorch.org/whl/cpu
+
 # Install the package (non-editable) + sentence-transformers
 RUN uv pip install --system --no-cache-dir . \
     && uv pip install --system --no-cache-dir sentence-transformers
