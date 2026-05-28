@@ -119,7 +119,7 @@ class MongoVectorStore:
     def _init_embeddings(self, embedding_model: str):
         """Initialize embedding model"""
 
-        if not self.collection:
+        if self.collection is None:
             self.logger.error("❌ Cannot initialize embeddings - MongoDB not connected")
             self.embeddings_model = None
             self.embedding_dim = None
@@ -148,21 +148,33 @@ class MongoVectorStore:
     def _ensure_indexes(self):
         """Create necessary indexes for efficient querying"""
 
-        if not self.collection:
+        if self.collection is None:
             return
 
         try:
-            # Create vector search index if using Atlas Vector Search
-            # This is optional - full-text search also works
-            pass
+            # Create text index on content for simple_search fallback
+            self.collection.create_index([("content", "text")], name="content_text_idx")
+            self.logger.info("✅ Text index created on 'content'")
         except Exception as e:
+            # Index may already exist — that's fine
             self.logger.debug(f"Index creation note: {e}")
+
+        try:
+            # Create compound index for folder_id + source lookups
+            self.collection.create_index(
+                [("metadata.folder_id", 1)],
+                name="folder_id_idx"
+            )
+        except Exception as e:
+            self.logger.debug(f"Folder index note: {e}")
 
     def store_document(
         self,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
-        source: Optional[str] = None
+        source: Optional[str] = None,
+        folder_id: Optional[str] = None,
+        query_text: Optional[str] = None,
     ) -> str:
         """
         Store a document with its embedding
@@ -171,26 +183,43 @@ class MongoVectorStore:
             content: Document content to store
             metadata: Optional metadata dictionary
             source: Source identifier (e.g., URL, file path)
+            folder_id: Optional folder/group identifier for organizing documents
+            query_text: Optional original query string.  When provided, a
+                        separate ``query_embedding`` is stored alongside the
+                        content embedding so that cache lookups can compare
+                        short-query-to-short-query (avoiding embedding dilution
+                        from long document content).
 
         Returns:
             Document ID
         """
 
-        if not self.collection or not self.embeddings_model:
+        if self.collection is None or self.embeddings_model is None:
             self.logger.warning("⚠️  Vector store not available - document not stored")
             return None
 
         try:
-            # Generate embedding
+            # Generate embedding for the full document content
             embedding = self.embeddings_model.encode(content).tolist()
+
+            # Merge folder_id into metadata
+            doc_metadata = metadata or {}
+            if folder_id:
+                doc_metadata["folder_id"] = folder_id
 
             # Create document
             doc = {
                 "content": content,
                 "embedding": embedding,
-                "metadata": metadata or {},
+                "metadata": doc_metadata,
                 "source": source,
             }
+
+            # Store a separate query embedding for cache-hit lookups
+            if query_text:
+                doc["query_embedding"] = self.embeddings_model.encode(
+                    query_text
+                ).tolist()
 
             # Store in MongoDB
             result = self.collection.insert_one(doc)
@@ -205,88 +234,86 @@ class MongoVectorStore:
         self,
         query: str,
         top_k: int = 5,
-        threshold: float = 0.3
+        threshold: float = 0.3,
+        folder_id: Optional[str] = None,
+        use_query_embedding: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        Search for similar documents
+        Search for similar documents using cosine similarity
 
         Args:
             query: Search query
             top_k: Number of results to return
             threshold: Similarity threshold (0-1)
+            folder_id: Optional folder to limit search scope
+            use_query_embedding: When True, compare the search query against
+                                 each document's ``query_embedding`` field
+                                 (short-to-short comparison) instead of the
+                                 full content ``embedding``.  Falls back to
+                                 the content embedding if a document has no
+                                 ``query_embedding``.
 
         Returns:
             List of similar documents with scores
         """
 
-        if not self.collection or not self.embeddings_model:
+        if self.collection is None or self.embeddings_model is None:
             self.logger.warning("⚠️  Vector store not available - returning empty results")
             return []
 
         try:
             # Generate query embedding
-            query_embedding = self.embeddings_model.encode(query).tolist()
+            query_embedding = np.array(self.embeddings_model.encode(query))
 
-            # Search using MongoDB aggregation
-            results = list(self.collection.aggregate([
-                {
-                    "$addFields": {
-                        "similarity": {
-                            "$let": {
-                                "vars": {
-                                    "dotProduct": {
-                                        "$reduce": {
-                                            "input": {"$range": [0, len(query_embedding)]},
-                                            "initialValue": 0,
-                                            "in": {
-                                                "$add": [
-                                                    "$$value",
-                                                    {
-                                                        "$multiply": [
-                                                            {"$arrayElemAt": ["$embedding", "$$this"]},
-                                                            query_embedding[len(query_embedding) - 1]  # Simplified
-                                                        ]
-                                                    }
-                                                ]
-                                            }
-                                        }
-                                    }
-                                },
-                                "in": {"$cond": [
-                                    {"$eq": ["$$dotProduct", 0]},
-                                    0,
-                                    {"$divide": ["$$dotProduct", {"$multiply": [
-                                        {"$sqrt": {
-                                            "$reduce": {
-                                                "input": "$embedding",
-                                                "initialValue": 0,
-                                                "in": {"$add": ["$$value", {"$multiply": ["$$this", "$$this"]}]}
-                                            }
-                                        }},
-                                        1  # Simplified norm
-                                    ]}]}
-                                ]}
-                            }
-                        }
-                    }
-                },
-                {"$sort": {"similarity": -1}},
-                {"$limit": top_k}
-            ]))
+            # Build MongoDB filter
+            mongo_filter = {}
+            if folder_id:
+                mongo_filter["metadata.folder_id"] = folder_id
 
-            # Format results
-            formatted_results = [
-                {
-                    "id": str(r.get("_id")),
-                    "content": r.get("content", ""),
-                    "metadata": r.get("metadata", {}),
-                    "source": r.get("source"),
-                    "score": r.get("similarity", 0)
-                }
-                for r in results
-            ]
+            # Determine which fields to fetch
+            projection = {
+                "content": 1, "metadata": 1, "source": 1, "embedding": 1,
+            }
+            if use_query_embedding:
+                projection["query_embedding"] = 1
 
-            return formatted_results
+            # Fetch documents with embeddings from MongoDB
+            cursor = self.collection.find(mongo_filter, projection)
+
+            # Compute cosine similarity in Python
+            scored_results = []
+            for doc in cursor:
+                # Pick the comparison vector
+                if use_query_embedding and doc.get("query_embedding"):
+                    doc_vec = np.array(doc["query_embedding"])
+                else:
+                    doc_vec = doc.get("embedding")
+                    if not doc_vec:
+                        continue
+                    doc_vec = np.array(doc_vec)
+
+                # Cosine similarity = dot(a, b) / (||a|| * ||b||)
+                dot_product = np.dot(query_embedding, doc_vec)
+                query_norm = np.linalg.norm(query_embedding)
+                doc_norm = np.linalg.norm(doc_vec)
+
+                if query_norm == 0 or doc_norm == 0:
+                    similarity = 0.0
+                else:
+                    similarity = float(dot_product / (query_norm * doc_norm))
+
+                if similarity >= threshold:
+                    scored_results.append({
+                        "id": str(doc.get("_id")),
+                        "content": doc.get("content", ""),
+                        "metadata": doc.get("metadata", {}),
+                        "source": doc.get("source"),
+                        "similarity": similarity
+                    })
+
+            # Sort by similarity descending and take top_k
+            scored_results.sort(key=lambda x: x["similarity"], reverse=True)
+            return scored_results[:top_k]
 
         except Exception as e:
             self.logger.error(f"❌ Search failed: {e}")
@@ -304,7 +331,7 @@ class MongoVectorStore:
             List of matching documents
         """
 
-        if not self.collection:
+        if self.collection is None:
             return []
 
         try:
@@ -337,13 +364,13 @@ class MongoVectorStore:
     ) -> List[Dict[str, Any]]:
         """Get documents from a specific folder"""
 
-        if not self.collection:
+        if self.collection is None:
             return []
 
         try:
             results = list(self.collection.find(
                 {"metadata.folder_id": folder_id},
-                {"embedding": 0}  # Exclude embeddings
+                {"embedding": 0}  # Exclude embeddings for performance
             ).limit(limit))
 
             formatted_results = [
@@ -362,10 +389,32 @@ class MongoVectorStore:
             self.logger.error(f"❌ Failed to get documents by folder: {e}")
             return []
 
+    def delete_folder_documents(self, folder_id: str) -> int:
+        """Delete all documents in a specific folder
+
+        Args:
+            folder_id: Folder identifier to delete documents from
+
+        Returns:
+            Number of documents deleted
+        """
+
+        if self.collection is None:
+            return 0
+
+        try:
+            result = self.collection.delete_many({"metadata.folder_id": folder_id})
+            deleted = result.deleted_count
+            self.logger.info(f"🗑️  Deleted {deleted} documents from folder '{folder_id}'")
+            return deleted
+        except Exception as e:
+            self.logger.error(f"❌ Failed to delete folder documents: {e}")
+            return 0
+
     def get_stats(self) -> Dict[str, Any]:
         """Get vector store statistics"""
 
-        if not self.collection:
+        if self.collection is None:
             return {
                 "status": "disconnected",
                 "embedding_dimension": None,
@@ -395,7 +444,7 @@ class MongoVectorStore:
     def health_check(self) -> bool:
         """Check if vector store is healthy"""
 
-        if not self.client:
+        if self.client is None:
             return False
 
         try:
@@ -407,7 +456,7 @@ class MongoVectorStore:
     def clear_all(self) -> bool:
         """Clear all documents (use with caution!)"""
 
-        if not self.collection:
+        if self.collection is None:
             return False
 
         try:

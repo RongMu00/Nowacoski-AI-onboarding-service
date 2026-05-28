@@ -8,9 +8,6 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from strands import Agent
 
-# Import VectorDB for caching
-from enterprise_ai.storage.vector_store import MongoVectorStore
-
 logger = logging.getLogger("drive_agent")
 
 
@@ -22,13 +19,18 @@ class OnboardingPlan:
     is_accessible: bool = True
     is_mock: bool = False
     error_message: Optional[str] = None
-    cached: bool = False  # Track if from cache
-    source: str = "fresh"  # "cache", "drive", or "mock"
+    source: str = "drive"
 
 
 class DriveAgent:
+    """Pure worker agent for Google Drive document fetching and analysis.
+
+    This agent only fetches from Google Drive and generates onboarding plans
+    — it does NOT manage its own cache.  All cache-vs-fetch decisions are
+    made by the orchestrator.
+    """
+
     def __init__(self, credentials: Credentials = None, service_account_path: str = None):
-        """Initialize DriveAgent with VectorDB caching"""
         self.logger = logging.getLogger("drive_agent")
         self.auth_method = "none"
 
@@ -61,14 +63,6 @@ class DriveAgent:
 
         self.agent = Agent(system_prompt=self._get_system_prompt())
 
-        # NEW: Initialize VectorDB for caching
-        try:
-            self.vector_store = MongoVectorStore()
-            self.logger.info("Vector store initialized for caching")
-        except Exception as e:
-            self.logger.warning(f"Vector store not available: {e}")
-            self.vector_store = None
-
     def _get_system_prompt(self) -> str:
         return """You are an onboarding assistant. Given content from various documents:
         1. Analyze and understand the onboarding requirements
@@ -78,28 +72,20 @@ class DriveAgent:
         Format your response as a numbered list of steps."""
 
     def create_onboarding_plan(self, drive_link: str) -> OnboardingPlan:
-        """Create onboarding plan with VectorDB caching"""
+        """Fetch and analyze Google Drive folder contents.
 
+        Always fetches from Google Drive — the orchestrator decides whether
+        to call this method or use cached content.
+        """
         try:
-            # Extract folder ID
             folder_id = self._extract_folder_id(drive_link)
             if not folder_id:
                 raise ValueError("Could not extract folder ID from link")
 
             self.logger.info(f"📁 Processing folder: {folder_id}")
 
-            # STEP 1: Check VectorDB cache first
-            all_content = self._get_cached_content(folder_id)
-            from_cache = len(all_content) > 0
-
-            if from_cache:
-                self.logger.info(f"Using {len(all_content)} cached documents from VectorDB")
-                source = "cache"
-            else:
-                # STEP 2: Fetch from Drive and cache
-                self.logger.info("No cache found, fetching from Google Drive...")
-                all_content = self._fetch_and_cache_content(folder_id)
-                source = "drive" if all_content else "fresh"
+            # Fetch from Drive
+            all_content = self._fetch_content(folder_id)
 
             if not all_content:
                 return OnboardingPlan(
@@ -112,15 +98,13 @@ class DriveAgent:
                     ],
                     estimated_duration="N/A",
                     is_accessible=False,
-                    cached=from_cache,
-                    source=source
+                    source="drive"
                 )
 
-            # STEP 3: Generate plan from content
+            # Generate plan from content
             prompt = f"Create an onboarding plan based on these documents:\n\n{''.join(all_content)}"
             response = self.agent(prompt)
 
-            # Parse response
             steps = [step.strip() for step in str(response).split('\n') if step.strip()]
 
             return OnboardingPlan(
@@ -128,34 +112,15 @@ class DriveAgent:
                 estimated_duration="1-2 weeks",
                 is_accessible=True,
                 is_mock=False,
-                cached=from_cache,
-                source=source
+                source="drive"
             )
 
         except Exception as e:
             self.logger.error(f"Error: {e}")
             return self._create_mock_onboarding_plan(drive_link)
 
-    def _get_cached_content(self, folder_id: str) -> List[str]:
-        """Retrieve cached documents from VectorDB"""
-        if not self.vector_store or not self.vector_store.collection:
-            return []
-
-        try:
-            docs = self.vector_store.get_documents_by_folder(folder_id, limit=100)
-
-            if docs:
-                self.logger.info(f"Retrieved {len(docs)} cached documents")
-                return [f"[{doc['source']}]\n{doc['content']}\n\n" for doc in docs]
-
-            return []
-
-        except Exception as e:
-            self.logger.warning(f"Could not retrieve cache: {e}")
-            return []
-
-    def _fetch_and_cache_content(self, folder_id: str) -> List[str]:
-        """Fetch from Google Drive and store in VectorDB"""
+    def _fetch_content(self, folder_id: str) -> List[str]:
+        """Fetch documents from Google Drive folder."""
         if not self.is_authenticated or not self.drive_service:
             self.logger.warning("Not authenticated, cannot fetch from Drive")
             return []
@@ -167,7 +132,6 @@ class DriveAgent:
                 return []
 
             all_content = []
-            stored_count = 0
             error_count = 0
 
             for doc in documents:
@@ -180,26 +144,8 @@ class DriveAgent:
                     )
 
                     if content and content.strip():
-                        # Store in VectorDB
-                        if self.vector_store:
-                            doc_id = self.vector_store.store_document(
-                                content=content,
-                                source=doc_name,
-                                folder_id=folder_id,
-                                metadata={
-                                    "mime_type": doc.get('mimeType'),
-                                    "drive_id": doc['id']
-                                }
-                            )
-
-                            if doc_id:
-                                all_content.append(f"[{doc_name}]\n{content}\n\n")
-                                stored_count += 1
-                                self.logger.info(f"Cached: {doc_name}")
-                            else:
-                                self.logger.info(f"Could not cache: {doc_name}")
-                        else:
-                            all_content.append(f"[{doc_name}]\n{content}\n\n")
+                        all_content.append(f"[{doc_name}]\n{content}\n\n")
+                        self.logger.info(f"Fetched: {doc_name}")
                     else:
                         self.logger.info(f"Skipped (empty): {doc_name}")
 
@@ -207,7 +153,9 @@ class DriveAgent:
                     error_count += 1
                     self.logger.warning(f"Error processing {doc.get('name')}: {e}")
 
-            self.logger.info(f"📊 Stored {stored_count} docs, errors: {error_count}")
+            self.logger.info(
+                f"📊 Fetched {len(all_content)} docs, errors: {error_count}"
+            )
             return all_content
 
         except Exception as e:
@@ -431,20 +379,5 @@ class DriveAgent:
             estimated_duration="3 weeks",
             is_accessible=False,
             is_mock=True,
-            cached=False,
             source="mock"
         )
-
-    def get_cache_stats(self) -> Dict:
-        """Get statistics about cached documents"""
-        if self.vector_store:
-            return self.vector_store.get_stats()
-        return {}
-
-    def clear_cache(self, folder_id: str) -> int:
-        """Clear cache for a specific folder"""
-        if self.vector_store:
-            deleted = self.vector_store.delete_folder_documents(folder_id)
-            self.logger.info(f"Cleared {deleted} cached documents")
-            return deleted
-        return 0

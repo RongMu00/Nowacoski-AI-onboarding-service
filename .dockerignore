@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+*.pyc
+.env
+.env.*
+token.pickle
+*.egg-info
+.mypy_cache
+.pytest_cache
+k8s/
+.DS_Store

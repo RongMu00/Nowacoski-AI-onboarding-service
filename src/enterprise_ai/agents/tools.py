@@ -146,7 +146,7 @@ def trigger_google_drive_agent(drive_links: str) -> str:
     try:
         # Initialize credentials and agent
         creds = None
-        service_account_path = '/Users/rongmu/Downloads/service_accounts_key.json'
+        service_account_path = os.getenv('SERVICE_ACCOUNT_PATH')
 
         # Step 1: Try to load user OAuth credentials (token.pickle)
         if os.path.exists('token.pickle'):
