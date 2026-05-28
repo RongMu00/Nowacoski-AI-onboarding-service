@@ -32,21 +32,21 @@ User Query
 │  5. ANSWER  ─ Generate final response       │
 │  6. RECORD  ─ Store sources for next turn   │
 │                                             │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
-│  │ Codebase │  │  Drive   │  │  Slack   │  │
-│  │  Agent   │  │  Agent   │  │  Agent   │  │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  │
-│       │              │              │        │
-│  Pure workers: fetch only, no cache logic    │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
+│  │ Codebase │  │  Drive   │  │  Slack   │   │
+│  │  Agent   │  │  Agent   │  │  Agent   │   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘   │
+│       │              │              │       │
+│  Pure workers: fetch only, no cache logic   │
 └──────────────────┬──────────────────────────┘
                    │
                    ▼
-         ┌─────────────────┐
+         ┌─────────────────-┐
          │ MongoDB Atlas    │
          │ VectorDB         │
          │ (embeddings +    │
          │  query_embedding)│
-         └─────────────────┘
+         └─────────────────-┘
 ```
 
 ### Batch Onboarding (Temporal)
