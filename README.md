@@ -49,6 +49,30 @@ User Query
          └─────────────────┘
 ```
 
+### Batch Onboarding (Temporal)
+
+For onboarding multiple hires at once, Nowacoski uses **Temporal durable workflows**:
+
+```
+Streamlit UI (Batch Mode)
+    │  upload CSV → start workflow → poll progress
+    ▼
+Temporal Server (PostgreSQL-backed)
+    │  persists workflow state, handles retries
+    ▼
+BatchOnboardingWorkflow
+    ├─ SingleHireOnboardingWorkflow (hire #1)
+    │   └─ run_onboarding_activity → OrchestratorAgent → plan
+    ├─ SingleHireOnboardingWorkflow (hire #2)
+    │   └─ run_onboarding_activity → OrchestratorAgent → plan
+    └─ ... (max 3 concurrent via worker config)
+```
+
+- **Fault tolerance** — Worker crashes mid-batch → restart → Temporal resumes from where it left off
+- **Automatic retry** — Failed hires retry with exponential backoff (3 attempts, 30s → 60s)
+- **Parallel processing** — Up to 3 hires processed concurrently per worker
+- **Progress tracking** — Real-time progress bar + per-hire results in Streamlit UI
+
 ### Key Design Decisions
 
 - **Pure worker agents** — Each agent (codebase, drive, slack, tavily) only fetches and analyzes. They never touch the cache. All cache-vs-fetch decisions are centralized in the orchestrator.
@@ -74,7 +98,8 @@ User Query
 | Vector Store | MongoDB Atlas + sentence-transformers (`all-MiniLM-L6-v2`) |
 | Web Search | Tavily API via MCP |
 | Frontend | Streamlit |
-| Infrastructure | Docker, Kubernetes (k8s manifests included) |
+| Workflow Engine | Temporal (durable execution, retry, crash recovery) |
+| Infrastructure | Docker Compose (5 services), Kubernetes (k8s manifests included) |
 
 ## Setup Instructions
 
@@ -122,7 +147,28 @@ SERVICE_ACCOUNT_PATH=/path/to/service-account.json
 streamlit run src/enterprise_ai/ui.py
 ```
 
-### 4. (Optional) Google Drive OAuth
+### 4. Run with Batch Mode (Temporal)
+
+```bash
+# Terminal 1: Start Temporal dev server
+temporal server start-dev
+
+# Terminal 2: Start the batch worker
+python -m enterprise_ai.batch.worker
+
+# Terminal 3: Start Streamlit
+streamlit run src/enterprise_ai/ui.py
+```
+
+Or with Docker Compose (all-in-one):
+
+```bash
+docker compose -f docker/docker-compose.yml up --build
+# Streamlit: http://localhost:8501
+# Temporal UI: http://localhost:8080
+```
+
+### 5. (Optional) Google Drive OAuth
 
 For user-level Drive access:
 
@@ -134,7 +180,8 @@ python src/enterprise_ai/agents/authorize_drive.py
 
 ```
 src/enterprise_ai/
-├── ui.py                          # Streamlit frontend
+├── ui.py                          # Streamlit frontend (Chat + Batch modes)
+├── batch_ui.py                    # Batch mode UI (upload, progress, results)
 ├── agents/
 │   ├── orchestrator_caching.py    # Plan-Action-Reflect orchestrator + ConversationMemory
 │   ├── codebase_agent_caching.py  # GitHub repo analysis (pure worker)
@@ -142,6 +189,11 @@ src/enterprise_ai/
 │   ├── slack_agent_caching.py     # Slack channel analysis (pure worker)
 │   ├── tavily_agent_caching.py    # Web search via Tavily MCP (pure worker)
 │   └── tools_caching.py           # @tool wrappers + raw search helpers
+├── batch/
+│   ├── models.py                  # NewHire dataclass + CSV parser
+│   ├── activities.py              # Temporal activity wrapping OrchestratorAgent
+│   ├── workflows.py               # BatchOnboarding + SingleHireOnboarding workflows
+│   └── worker.py                  # Temporal worker entry point
 └── storage/
     └── vector_store.py            # MongoDB VectorDB with dual embeddings
 ```
